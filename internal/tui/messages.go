@@ -1,7 +1,7 @@
 package tui
 
 import (
-	"github.com/leon/claude-sessions/internal/session"
+	"github.com/LeonKohli/claude-sessions/internal/session"
 )
 
 // SessionsLoadedMsg is sent when the session index is ready.
@@ -12,7 +12,7 @@ type SessionsLoadedMsg struct {
 // PreviewLoadedMsg is sent when session preview data is ready.
 type PreviewLoadedMsg struct {
 	SessionID  string
-	Messages   []session.Message
+	Messages   []session.PreviewMessage
 	Enrichment *session.EnrichmentData
 }
 

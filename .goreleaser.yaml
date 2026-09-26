@@ -1,0 +1,26 @@
+version: 2
+project_name: agent-sessions
+builds:
+  - binary: agent-sessions
+    main: ./cmd/agent-sessions
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - skills/search-sessions/SKILL.md
+      - skills/search-sessions/scripts/search.sh
+checksum:
+  name_template: SHA256SUMS

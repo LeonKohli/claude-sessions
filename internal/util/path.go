@@ -8,21 +8,22 @@ import (
 	"time"
 )
 
-// ClaudeProjectsDir returns the path to ~/.claude/projects/
-func ClaudeProjectsDir() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".claude", "projects")
-}
-
-// CacheDir returns ~/.cache/claude-sessions/
-func CacheDir() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".cache", "claude-sessions")
+// CacheDir follows the platform's user cache location, including XDG_CACHE_HOME.
+func CacheDir() (string, error) {
+	base, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, "agent-sessions"), nil
 }
 
 // CachePath returns the full path to the gob cache file.
-func CachePath() string {
-	return filepath.Join(CacheDir(), "index.gob")
+func CachePath() (string, error) {
+	dir, err := CacheDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "index.gob"), nil
 }
 
 // DecodeProjectDirName decodes a Claude projects directory name.

@@ -1,141 +1,249 @@
-# claude-sessions
+# agent-sessions
 
-TUI for browsing, searching, and resuming Claude Code sessions.
+Search, read, and recover files from **Claude Code** and **Codex** session history — from a terminal or from a coding agent.
 
-Replaces the slow bash script that spawned `rg`/`jq`/`fzf` on every keystroke across 1GB+ of JSONL files. This loads in <1ms from cache.
+Both agents leave multi-GB piles of JSONL you can only get back into through their own cwd-scoped pickers. This indexes all of it and exposes it two ways: an interactive browser for you, and a structured, bounded CLI for the agent sitting next to you.
 
 ![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go) ![Bubbletea](https://img.shields.io/badge/Bubbletea-TUI-FF75B5)
 
-## Features
+## Two surfaces
 
-- **Cached index** — Gob cache at `~/.cache/claude-sessions/index.gob`, mtime-based invalidation. Cold scan ~800ms, warm ~1ms.
-- **Fuzzy search** — Instant word-split substring matching over summary, first prompt, project path, git branch.
-- **Deep content search** — `Tab` toggles grep mode. Parallel workers (`NumCPU` goroutines), 300ms debounce, context snippets around matches.
-- **Split-panel layout** — Session list (left) + rich preview (right). Conversation messages, token stats, tools used, files modified.
-- **Lazy enrichment** — Full JSONL scan runs on preview, extracting tokens, model, tools, files. Results cached in memory for sorting.
-- **Sort** — `s` cycles: modified, created, tokens, messages, duration, size.
-- **Filter** — `p` cycles project, `d` cycles date (all/today/week/month).
-- **Resume** — `Enter` does `chdir(projectPath)` then `exec("claude", "--resume", uuid)`.
-- **Copy UUID** — `y` copies session UUID to clipboard.
-
-## Layout
-
-```
-╭─ Search: [__________]  [fuzzy]  S:modified  198/198 ────────────╮
-│                            │                                     │
-│  just now  21ce05..        │  Session: 21ce0506-6762-...         │
-│  ~/Documents/myproject     │  Project: ~/Documents/myproject     │
-│  > "Design a TUI app..."  │  Branch:  main                      │
-│                            │  Time:    14:14 → 15:32 (1h18m)    │
-│  2h ago    65d8b9..        │  Stats:   146 msgs │ 1.2 MB        │
-│  ~/work/api                │  Tokens:  in: 12K  out: 8.5K       │
-│  "fix auth middleware"     │  Tools:   Read, Edit, Bash          │
-│                            │  Files:   5 — auth.go, main.go...  │
-│                            │  ─────────────────────              │
-│                            │  [usr] 14:14 "Design..."            │
-│                            │  [ast] 14:15 "I'll start..."        │
-├────────────────────────────┴─────────────────────────────────────┤
-│ ↑↓ nav  / search  tab deep  s sort  p project  d date           │
-│ ⏎ resume  y copy  q quit                                        │
-╰──────────────────────────────────────────────────────────────────╯
+```bash
+agent-sessions                                    # interactive browser (terminal only)
+agent-sessions search "webhook retry" -o json     # everything else: non-interactive
 ```
 
-## Keybindings
+Running it bare on a TTY opens the browser. Piped, or with any subcommand, it never blocks and never renders a UI — [CLI Spec](https://clispec.dev) principle 4. That distinction is the whole point: a tool that opens a TUI when an agent calls it is a tool an agent cannot use.
+
+### For agents
+
+| Command | Purpose |
+|---|---|
+| `search <query>` | Sessions matching a query, ranked by match count, with snippets |
+| `show <id>` | The conversation |
+| `files <id>` | What the session changed on disk, and whether content is recoverable |
+| `cat <id> <path>` | Recovered file content, raw bytes, no envelope |
+| `diff <id> <path>` | Unified diffs Codex recorded for a file |
+| `resume <id>` | The command that reopens it, plus `cwd_exists` (prints, never execs) |
+| `list` | Recent sessions |
+| `schema` | Commands, flags, and error codes as JSON |
+
+Flags: `--output auto\|json\|text`, `--agent claude\|codex`, `--project`, `--since 72h`, `--limit`, `--snippets`, `--max-chars`, `--subagents`.
+
+Every response is an envelope, and truncation is always declared:
+
+```json
+{"ok":true,"schema":1,"cmd":"search","data":{"query":"error","hits":[…],"count":5},
+ "truncated":{"returned":5,"total":848,"has_more":true,"hint":"raise --limit to see more (total 848)"}}
+```
+
+`total` appears only when the command actually counted the full set. `show` reads lazily and reports `has_more` with no `total` — inventing one from the window it happened to read would tell a caller it had the whole conversation after one more request.
+
+Failures go to **stderr** with a stable code and a non-zero exit, so a consumer piping stdout never has to disentangle them from data:
+
+```json
+{"ok":false,"schema":1,"cmd":"cat","error":{
+  "code":"not_recoverable",
+  "message":"codex recorded links.ts as \"update\", which stores only a unified diff…",
+  "hint":"try `agent-sessions diff <id> <path>`"}}
+```
+
+Codes: `usage_error`, `not_found`, `ambiguous_id`, `store_unavailable`, `not_recoverable`, `internal_error`.
+
+### Why structured output rather than grep
+
+Measured on this machine's store (3,961 sessions, ~3 GB), searching the term `error`:
+
+| | Raw `rg` over the stores | `agent-sessions search --limit 5` |
+|---|---|---|
+| Wall clock | **did not finish in 120 s** | 4.2 s |
+| Returned | unbounded | 3.4 KB (~855 tokens) |
+| Coverage | unknown | `5 of 848`, declared |
+
+Bounded output is not politeness. An unbounded result is one an agent cannot afford to read, which makes the history effectively unavailable.
+
+### Argument handling
+
+Agents generalise flag spellings from whatever tool they saw last, and a rejected spelling costs a whole turn to recover from. These all work:
+
+```bash
+agent-sessions search unified diff --limit 2     # unquoted multi-word query
+agent-sessions search "unified" --json           # --json / --robot → --output json
+agent-sessions search --query "unified"          # named operand lifted to positional
+agent-sessions list --provider codex             # --provider / --tool → --agent
+agent-sessions search "x" --max_results 5        # snake_case → --limit
+```
+
+Flags may appear before or after the operand. Go's `flag` package stops at the first positional, which silently folded trailing flags into the query — `search "auth" --limit 2` searched for the literal string `auth --limit 2` and returned nothing, with no error. Unknown flags produce a structured `usage_error` listing the accepted ones, with no usage block leaking onto stderr ahead of the JSON.
+
+### Alternatives
+
+[**cass**](https://github.com/Dicklesworthstone/coding_agent_session_search) is the serious tool in this space — 21k lines of Rust, 23 agents, a persistent Tantivy index, and lexical/semantic/hybrid search. If you want breadth or fast repeated search, use it. It is also where the `--json`/`--robot` convention and the "never run bare in an agent context" warning come from.
+
+Where this tool differs:
+
+- **File recovery.** `files`/`cat`/`diff` retrieve a file as it existed in a past session. cass indexes conversations; it does not reconstruct file content.
+- **Codex's own thread index.** Discovery reads `state_<n>.sqlite` — the database `codex resume` itself trusts — so titles, archived state and token totals match what Codex reports. Other tools read the rollout JSONL only.
+- **Scope.** Two agents, ~1,500 lines, no embeddings, no daemon, no model downloads.
+
+The honest gap is search cost. This greps every transcript per query at ~500 MB/s: **~4 s over 3 GB, ~12 s over 6 GB with subagents.** A prebuilt inverted index answers in milliseconds. That is fine for occasional recall and wrong for a tight loop — if you start calling `search` repeatedly, use cass.
+
+### For humans
 
 | Key | Action |
 |-----|--------|
-| `↑/k` `↓/j` | Navigate |
-| `g` / `G` | Jump to top / bottom |
-| `Ctrl+u` / `Ctrl+d` | Half page up / down |
-| `/` | Focus search input |
-| `Tab` | Toggle fuzzy ↔ deep search |
-| `Esc` | Clear search / exit search |
-| `s` | Cycle sort mode |
-| `p` | Cycle project filter |
-| `d` | Cycle date filter |
-| `Enter` | Resume selected session in Claude Code |
-| `y` | Copy session UUID to clipboard |
-| `q` / `Ctrl+c` | Quit |
+| `↑/k` `↓/j`, `g`/`G`, `Ctrl+u`/`Ctrl+d` | Navigate |
+| `/` | Search · `Tab` fuzzy ↔ deep · `Esc` clear |
+| `s` `p` `d` | Cycle sort / project / date |
+| `f` | Cycle agent filter (all → claude → codex) |
+| `a` | Show/hide subagent threads |
+| `Enter` | Resume · `y` copy id · `q` quit |
+
+```
+╭─ Search: [__________]         fuzzy  +sub  S:modified  4/4 ──────────────────╮
+├──────────────────────────────────────┬───────────────────────────────────────┤
+│ ▸ 1h ago 019fa425-796  cx  gpt-5.6-  │ 019fa425-7964-7041-b895-b331deb81e89  │
+│   ~/Documents/motion                 │ Project:  ~/Documents/motion          │
+│   Audit the repository               │ Branch:   codex/motion                │
+│   2h ago 21ce0506-676  cc  opus-4.6  │ Tokens:   in: 12K  out: 8.5K          │
+│   ~/work/api                         │ Tools:    exec_command, query_docs    │
+│   Fix auth middleware                │ Files:    5 — auth.go, main.go…       │
+├──────────────────────────────────────┴───────────────────────────────────────┤
+│ ↑↓ nav  / search  tab deep  s sort  p project  d date  f agent  a subagents  │
+╰──────────────────────────────────────────────────────────────────────────────╯
+```
+
+## File recovery
+
+`files` reports `kind` (`add`/`update`/`delete`), `revisions`, and `recoverable`. What is recoverable differs by agent, and the difference is architectural rather than an oversight:
+
+| | Claude Code | Codex |
+|---|---|---|
+| Model | snapshots **state** | journals **transitions** |
+| Store | `~/.claude/file-history/<session>/<hash>@vN` | inline in the rollout |
+| Added / deleted files | byte-exact | byte-exact |
+| Modified files | **byte-exact, every revision** | **unified diff only** |
+
+Claude writes each tracked revision to disk, so restoring is a file read. Codex records what changed, not what things were — for adds and deletes those collapse to the same thing, for updates they don't. `cat` therefore fails on a Codex update with `not_recoverable` and points at `diff`.
 
 ## How it works
 
-### Session discovery
+### Claude Code
 
-Claude Code stores sessions under `~/.claude/projects/<encoded-dir>/`:
+`~/.claude/projects/<encoded-dir>/` (honours `CLAUDE_CONFIG_DIR`). A `sessions-index.json` covers some sessions; the rest are read from the transcript head, parsing only line 0 and lines containing `"type":"user"`.
 
-1. **`sessions-index.json`** — Pre-built metadata (UUID, summary, firstPrompt, messageCount, timestamps, projectPath, gitBranch). Covers ~25% of sessions.
-2. **`.jsonl` files** — Raw conversation logs. First 100 lines scanned for first user prompt, CWD, git branch, timestamp.
+Project paths resolve in order: `originalPath` from a `sessions-index.json` → its `projectPath` → the `cwd` recorded in the transcript → the decoded directory name.
 
-Filters out:
-- Agent files (`agent-*.jsonl`)
-- Sidechains
-- Ghost entries (index points to non-existent files)
-- Empty sessions (no user messages — progress events, file-history-snapshots only)
+That last step is a guess and must stay one. Directory names encode `/` as `-` (`-Users-example-projects` → `/Users/example/projects`), which is irreversible for any project whose own name contains a hyphen: `client-app/ui-components` decodes to `client/app/ui/components`. Transcripts open with `last-prompt`/`mode`/`permission-mode` records whose `cwd` is null, so reading it from line 0 alone yields nothing and drops straight through to that guess — which is how `resume` ends up emitting a `cd` into a directory that never existed. The reader therefore keeps scanning until it finds a non-null `cwd`.
 
-### Path resolution
+Tracked file paths are recorded relative to the project and re-anchored with `realParentDir`.
 
-Project directory names are encoded (`-Users-leon-Documents` → `/Users/leon/Documents`). Resolution hierarchy:
+Subagent transcripts (`<parent>/subagents/agent-*.jsonl`) are indexed but hidden. Claude reuses the same agent id under different parents, so their ids are qualified as `<parent>/agent-<id>`. They are not resumable, and the tool says so rather than emitting a command that fails.
 
-1. `originalPath` from `sessions-index.json`
-2. `projectPath` from session index entry
-3. `cwd` field from first JSONL message
-4. Decoded directory name (last resort)
+### Codex
+
+One rollout per thread at `~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<uuid>.jsonl` (honours `CODEX_HOME`). Every line is `{timestamp, type, payload}`:
+
+| Line | Carries |
+|------|---------|
+| `session_meta` (first) | thread id, cwd, git branch, cli version, `thread_source` |
+| `turn_context` | model, reasoning effort, sandbox policy |
+| `event_msg` / `user_message`, `agent_message` | the conversation |
+| `event_msg` / `token_count` | **running totals** — the last one wins, they are not summed |
+| `event_msg` / `patch_apply_end` | `changes`: content for add/delete, `unified_diff` for update |
+| `response_item` / `function_call` | tool names |
+
+Discovery prefers Codex's own SQLite thread index (`~/.codex/state_<n>.sqlite`, the same one `codex resume` trusts), opened read-only with a busy timeout. It supplies title, token total, model, git branch and archived state without reading a transcript.
+
+It is treated as a fast path, not gospel — the highest-numbered `state_<n>.sqlite` wins since the suffix bumps on migrations; columns are probed via `PRAGMA table_info` because the table has grown by `ALTER TABLE`; ghost rows are dropped; rows with no title get their prompt backfilled from the transcript; and if the database is unreadable a parallel rollout walk replaces it entirely. That fallback is not hypothetical: reading the live database fails transiently while Codex checkpoints.
+
+### Session ids
+
+Listings show a 12-character prefix, not the conventional 8. Codex ids are UUIDv7 so sessions from the same period share a long prefix, and Claude subagent ids all begin `agent-`. Measured here, an 8-character prefix is ambiguous for **64% of Claude sessions and 37% of Codex ones**; 12 resolves every one. Commands accept any unambiguous prefix and return `ambiguous_id` otherwise.
 
 ### Caching
 
-Gob-encoded `[]SessionEntry` + mtime map. Invalidated when any project directory or `sessions-index.json` is modified. Cache saved in background goroutine after scan.
+The gob index uses [Go's user cache directory](https://pkg.go.dev/os#UserCacheDir): `~/Library/Caches/agent-sessions/index.gob` on macOS and `$XDG_CACHE_HOME/agent-sessions/index.gob` on Linux, defaulting to `~/.cache`. It is versioned and fingerprinted with its transcript stores and state database. Changing `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, or `CODEX_SQLITE_HOME` prevents reuse of another store's index. Transcript sizes and modification times invalidate stale metadata even when a session is appended without changing its parent directory. Cache files are private to the user.
 
-### Enrichment
+The write is synchronous. Doing it in a background goroutine works fine for the browser and never completes for anything else: a subcommand exits before the goroutine runs, so every invocation re-scanned the whole store and left an orphaned `.tmp` behind. Encoding costs ~30 ms against a ~2 s scan.
 
-On first preview of a session, full JSONL scan extracts:
-- Token usage (input, output, cache read, cache write)
-- Primary model (most frequent across assistant messages)
-- Tools used (from `tool_use` content blocks)
-- Files modified (from `file-history-snapshot` entries)
-- Actual message count
-
-Pre-filters lines with `strings.Contains` before JSON parsing for performance.
+**Cold ~2 s for ~4,000 sessions across both agents; warm ~40 ms.**
 
 ## Architecture
 
 ```
-main.go                          # Load → TUI → ExecResume
+cmd/agent-sessions/main.go       # cli.Run → subcommand, or the browser on a TTY
 internal/
+  cli/                           # agent-facing surface
+    dispatch.go                  # routing, flags, error classification, schema
+    commands.go                  # list, search, show, files, cat, diff, resume
+    output.go                    # envelope, TTY detection, stdout/stderr split
+    args.go                      # flag/positional split (flags may follow operands)
+  provider/provider.go           # Kind enum, store locations, resume argv
   session/
-    types.go                     # SessionEntry, Message, Usage structs
-    reader.go                    # JSONL streaming (bufio.Scanner, pre-filter)
-    enrich.go                    # Full scan: tokens, model, tools, files
+    types.go                     # SessionEntry, PreviewMessage, dispatch
+    reader.go / enrich.go        # Claude transcripts
+    codex.go                     # Codex rollouts
+    files.go                     # file changes + recovery, both providers
   index/
-    scanner.go                   # Walk projects dir, parse index + JSONL
-    cache.go                     # Gob cache with mtime invalidation
-    index.go                     # Load orchestrator (cache → scan → save)
-  tui/
-    app.go                       # Bubbletea model, Update loop, filters, sort
-    view.go                      # Render: search bar, list, preview, status
-    deep.go                      # Parallel grep across JSONL files
-    keymap.go                    # Key bindings
-    styles.go                    # Lipgloss theme (purple/gray)
-    messages.go                  # Tea message types
-  util/
-    path.go                      # Path resolution, formatting (time, tokens, size)
-    clipboard.go                 # pbcopy wrapper
+    scanner.go                   # Claude store walk (parallel)
+    codex.go                     # SQLite fast path + rollout fallback
+    search.go                    # parallel transcript grep, shared by CLI and TUI
+    cache.go / index.go          # gob cache, concurrent load
+  tui/                           # browser
+  util/                          # paths, formatting, clipboard
 ```
 
 ## Build & install
 
+The same Go source builds on macOS and Linux. SQLite is pure Go and does not require a system library.
+
+Tagged [releases](https://github.com/LeonKohli/claude-sessions/releases) package the `agent-sessions` binary and `skills/search-sessions/` together for macOS and Linux, on amd64 and arm64. Verify the archive against the release SHA256SUMS, extract it, and install the binary in a directory on your PATH. Install or link the bundled skill directory in your agent's skills directory. The skill requires the binary on PATH and does not download or build it.
+
+For a source installation, use a published tag or exact commit:
+
 ```bash
-go build -ldflags="-s -w" -o claude-sessions .
-# Atomic install (avoids macOS code signature issues):
-mv claude-sessions ~/.local/bin/
-codesign -s - ~/.local/bin/claude-sessions
+go install github.com/LeonKohli/claude-sessions/cmd/agent-sessions@<version>
 ```
+
+Or build from the checkout:
+
+```bash
+go build -ldflags="-s -w" -o agent-sessions ./cmd/agent-sessions
+mv agent-sessions ~/.local/bin/
+```
+
+The browser copies IDs with macOS `pbcopy`, Wayland [`wl-copy`](https://github.com/bugaevc/wl-clipboard), or X11 `xclip`. Install `wl-clipboard` or `xclip` for the Linux desktop you use. A missing desktop or clipboard command produces a visible error. CLI commands do not require clipboard tools.
+
+Transcript roots follow the documented [`CLAUDE_CONFIG_DIR`](https://code.claude.com/docs/en/env-vars) and [`CODEX_HOME`](https://developers.openai.com/codex/environment-variables). The Codex SQLite fast path also honours `CODEX_SQLITE_HOME`. The tool does not parse Codex's `sqlite_home` configuration option; if no database is found at the selected location, it reads the rollout files.
+
+## Releases
+
+CI tests on Linux and macOS with isolated transcript roots. A `v*` tag runs [GoReleaser](https://goreleaser.com/) to build the four platform archives and SHA256SUMS. All archives include the skill from the same commit as the binary.
+
+To check packaging without publishing:
+
+```bash
+goreleaser check
+goreleaser release --snapshot --clean
+```
+
+## Testing
+
+```bash
+go test ./...
+```
+
+`TestCommandsWithRelocatedStores` runs the public CLI dispatcher against synthetic Claude and Codex histories. It checks search, show, files, and resume with custom roots and a project path containing spaces. The tests also cover provider discovery and cache isolation.
+
+Some existing index tests inspect local Codex history when it is available. To run only against fixtures, point both provider roots at empty temporary directories before running `go test ./...`.
 
 ## Dependencies
 
-| Package | Version | Purpose |
-|---------|---------|---------|
-| [bubbletea](https://github.com/charmbracelet/bubbletea) | v1.3 | TUI framework |
-| [bubbles](https://github.com/charmbracelet/bubbles) | v0.21 | Text input component |
-| [lipgloss](https://github.com/charmbracelet/lipgloss) | v1.1 | Terminal styling |
+| Package | Purpose |
+|---------|---------|
+| [bubbletea](https://github.com/charmbracelet/bubbletea) / [bubbles](https://github.com/charmbracelet/bubbles) / [lipgloss](https://github.com/charmbracelet/lipgloss) | TUI |
+| [modernc.org/sqlite](https://modernc.org/sqlite) | Codex thread index (pure Go, no cgo) |
+| [golang.org/x/term](https://pkg.go.dev/golang.org/x/term) | TTY detection |
 
-No runtime dependencies. No `rg`, `jq`, `fzf`, or any external tools needed.
+CLI commands require no external search tools or system SQLite. The browser's copy action needs the desktop clipboard command described above.

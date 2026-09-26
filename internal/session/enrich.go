@@ -4,37 +4,44 @@ import (
 	"bufio"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 )
-
-// EnrichmentData holds the extracted metrics from a full JSONL scan.
-type EnrichmentData struct {
-	TotalInputTokens  int64
-	TotalOutputTokens int64
-	CacheReadTokens   int64
-	CacheWriteTokens  int64
-	Model             string // most-used model
-	ToolsUsed         []string
-	FilesModified     []string
-	MessageCount      int // actual user+assistant count
-}
 
 // enrichLine is a lightweight struct for parsing only the fields we need.
 type enrichLine struct {
 	Type    string `json:"type"`
 	Message *struct {
-		Role    string `json:"role"`
-		Model   string `json:"model"`
-		Usage   *Usage `json:"usage"`
+		Role    string          `json:"role"`
+		Model   string          `json:"model"`
+		Usage   *Usage          `json:"usage"`
 		Content json.RawMessage `json:"content"`
 	} `json:"message"`
 	Snapshot *struct {
-		TrackedFileBackups map[string]interface{} `json:"trackedFileBackups"`
+		TrackedFileBackups map[string]fileBackup `json:"trackedFileBackups"`
 	} `json:"snapshot"`
 }
 
-// EnrichSession does a full scan of a JSONL file to extract metrics.
-func EnrichSession(path string) (*EnrichmentData, error) {
+// fileBackup describes one tracked file inside a file-history-snapshot. The map
+// key is the path as Claude recorded it, usually relative to the project root,
+// while realParentDir carries the absolute directory it actually lived in.
+type fileBackup struct {
+	BackupFileName string `json:"backupFileName"`
+	Version        int    `json:"version"`
+	RealParentDir  string `json:"realParentDir"`
+}
+
+// absPath resolves a tracked file to an absolute path, so Claude entries are
+// comparable with Codex ones, which are always absolute.
+func (b fileBackup) absPath(key string) string {
+	if filepath.IsAbs(key) || b.RealParentDir == "" {
+		return key
+	}
+	return filepath.Join(b.RealParentDir, filepath.Base(key))
+}
+
+// EnrichClaudeSession does a full scan of a JSONL file to extract metrics.
+func EnrichClaudeSession(path string) (*EnrichmentData, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -93,8 +100,8 @@ func EnrichSession(path string) (*EnrichmentData, error) {
 
 		// Extract file names from snapshots
 		if line.Type == "file-history-snapshot" && line.Snapshot != nil {
-			for fname := range line.Snapshot.TrackedFileBackups {
-				fileSet[fname] = true
+			for fname, backup := range line.Snapshot.TrackedFileBackups {
+				fileSet[backup.absPath(fname)] = true
 			}
 		}
 	}
@@ -109,7 +116,7 @@ func EnrichSession(path string) (*EnrichmentData, error) {
 	}
 
 	// Shorten model name for display
-	data.Model = shortenModel(data.Model)
+	data.Model = ShortenModel(data.Model)
 
 	// Collect tools and files
 	for tool := range toolSet {
@@ -141,9 +148,12 @@ func extractToolNames(content json.RawMessage, toolSet map[string]bool) {
 	}
 }
 
-// shortenModel converts full model IDs to readable names.
-func shortenModel(model string) string {
+// ShortenModel converts full model IDs to readable names. Codex model IDs
+// (gpt-5.6-sol, codex-auto-review) are already short and pass through.
+func ShortenModel(model string) string {
 	switch {
+	case model == "":
+		return ""
 	case strings.Contains(model, "opus-4-6"):
 		return "opus-4.6"
 	case strings.Contains(model, "opus-4-5"):
@@ -160,8 +170,6 @@ func shortenModel(model string) string {
 		return "haiku-4"
 	case strings.Contains(model, "sonnet-3-5"):
 		return "sonnet-3.5"
-	case model == "":
-		return ""
 	default:
 		// Trim common prefixes
 		model = strings.TrimPrefix(model, "claude-")

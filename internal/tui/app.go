@@ -13,9 +13,43 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/leon/claude-sessions/internal/session"
-	"github.com/leon/claude-sessions/internal/util"
+	"github.com/LeonKohli/claude-sessions/internal/provider"
+	"github.com/LeonKohli/claude-sessions/internal/session"
+	"github.com/LeonKohli/claude-sessions/internal/util"
 )
+
+// providerFilter cycles all → claude → codex.
+type providerFilter int
+
+const (
+	providerAll providerFilter = iota
+	providerClaude
+	providerCodex
+	providerFilterCount
+)
+
+func (p providerFilter) String() string {
+	switch p {
+	case providerClaude:
+		return "claude"
+	case providerCodex:
+		return "codex"
+	default:
+		return "all"
+	}
+}
+
+// matches reports whether an entry passes this filter.
+func (p providerFilter) matches(k provider.Kind) bool {
+	switch p {
+	case providerClaude:
+		return k == provider.Claude
+	case providerCodex:
+		return k == provider.Codex
+	default:
+		return true
+	}
+}
 
 type searchMode int
 
@@ -93,17 +127,19 @@ type Model struct {
 	deepCancel    context.CancelFunc
 
 	// Filters
-	projectFilter string // empty = all
-	projects      []string
-	projectIdx    int
-	dateFilter    dateFilter
-	sortBy        sortMode
+	projectFilter  string // empty = all
+	projects       []string
+	projectIdx     int
+	dateFilter     dateFilter
+	providerFilter providerFilter
+	showSubagents  bool
+	sortBy         sortMode
 
 	// Preview
-	previewMsgs        []session.Message
-	previewSessID      string
-	previewEnrichment  *session.EnrichmentData
-	previewScroll      int
+	previewMsgs       []session.PreviewMessage
+	previewSessID     string
+	previewEnrichment *session.EnrichmentData
+	previewScroll     int
 
 	// UI state
 	width  int
@@ -114,6 +150,7 @@ type Model struct {
 	// Resume action
 	resumeSessionID string
 	resumeProject   string
+	resumeProvider  provider.Kind
 }
 
 func NewModel(sessions []session.SessionEntry) Model {
@@ -307,8 +344,17 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, keys.Enter):
 		if len(m.filtered) > 0 && m.cursor < len(m.filtered) {
 			s := m.filtered[m.cursor]
+			// Claude writes subagent transcripts under an agent-<uuid> name
+			// that its own --resume cannot resolve. Codex spawned threads are
+			// real threads and resume fine.
+			if s.Provider == provider.Claude && s.IsSubagent {
+				return m, func() tea.Msg {
+					return ToastMsg{Text: "subagent transcripts aren't resumable"}
+				}
+			}
 			m.resumeSessionID = s.SessionID
 			m.resumeProject = s.ProjectPath
+			m.resumeProvider = s.Provider
 			return m, tea.Quit
 		}
 
@@ -334,6 +380,10 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if err := util.CopyToClipboard(s.SessionID); err == nil {
 				return m, func() tea.Msg {
 					return ToastMsg{Text: "UUID copied!"}
+				}
+			} else {
+				return m, func() tea.Msg {
+					return ToastMsg{Text: err.Error()}
 				}
 			}
 		}
@@ -362,6 +412,20 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, keys.DateFilter):
 		m.dateFilter = (m.dateFilter + 1) % 4
+		m.cursor = 0
+		m.scrollOffset = 0
+		m.applyFilters()
+		return m, m.triggerPreview()
+
+	case key.Matches(msg, keys.Provider):
+		m.providerFilter = (m.providerFilter + 1) % providerFilterCount
+		m.cursor = 0
+		m.scrollOffset = 0
+		m.applyFilters()
+		return m, m.triggerPreview()
+
+	case key.Matches(msg, keys.Subagents):
+		m.showSubagents = !m.showSubagents
 		m.cursor = 0
 		m.scrollOffset = 0
 		m.applyFilters()
@@ -441,7 +505,11 @@ func (m *Model) applyFilters() {
 	m.filtered = nil
 
 	for _, s := range m.allSessions {
-		if s.IsSidechain {
+		if s.IsSubagent && !m.showSubagents {
+			continue
+		}
+
+		if !m.providerFilter.matches(s.Provider) {
 			continue
 		}
 
@@ -509,7 +577,8 @@ func (m *Model) applyFilters() {
 func smartMatch(query string, s session.SessionEntry) bool {
 	searchable := strings.ToLower(
 		s.Summary + " " + s.FirstPrompt + " " +
-			s.ProjectPath + " " + s.GitBranch + " " + s.SessionID)
+			s.ProjectPath + " " + s.GitBranch + " " + s.SessionID + " " +
+			s.Provider.String() + " " + s.Model + " " + s.AgentLabel)
 
 	words := strings.Fields(query)
 	for _, w := range words {
@@ -574,12 +643,13 @@ func (m *Model) triggerPreview() tea.Cmd {
 	m.previewEnrichment = nil
 	path := s.FullPath
 	sid := s.SessionID
+	kind := s.Provider
 	enriched := s.Enriched
 	return func() tea.Msg {
-		msgs, _ := session.ReadMessages(path, 30)
+		msgs, _ := session.ReadPreview(kind, path, 30)
 		var enrichment *session.EnrichmentData
 		if !enriched {
-			enrichment, _ = session.EnrichSession(path)
+			enrichment, _ = session.Enrich(kind, path)
 		}
 		return PreviewLoadedMsg{SessionID: sid, Messages: msgs, Enrichment: enrichment}
 	}
@@ -601,7 +671,11 @@ func (m Model) runDeepSearch(query string) tea.Cmd {
 	}
 }
 
-// ExecResume is called after tea.Program exits to exec into claude.
+// ExecResume is called after tea.Program exits to hand off to the agent CLI.
+//
+// Both agents are launched from the session's own directory. Claude needs it to
+// locate the transcript at all; Codex would otherwise notice the mismatch and
+// interrupt the resume with an interactive working-directory prompt.
 func (m Model) ExecResume() {
 	if m.resumeSessionID == "" {
 		return
@@ -611,19 +685,20 @@ func (m Model) ExecResume() {
 		os.Chdir(m.resumeProject)
 	}
 
-	claudePath, err := findClaude()
+	bin, argv := m.resumeProvider.ResumeArgv(m.resumeSessionID)
+	binPath, err := lookPath(bin)
 	if err != nil {
-		os.Stderr.WriteString("Error finding claude: " + err.Error() + "\n")
+		os.Stderr.WriteString("Could not find " + bin + " on PATH\n")
 		os.Exit(1)
 	}
 
-	syscall.Exec(claudePath, []string{"claude", "--resume", m.resumeSessionID}, os.Environ())
+	syscall.Exec(binPath, argv, os.Environ())
 }
 
-func findClaude() (string, error) {
+func lookPath(bin string) (string, error) {
 	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
-		p := filepath.Join(dir, "claude")
-		if _, err := os.Stat(p); err == nil {
+		p := filepath.Join(dir, bin)
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
 			return p, nil
 		}
 	}

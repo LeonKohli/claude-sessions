@@ -13,6 +13,8 @@ type keyMap struct {
 	CopyUUID   key.Binding
 	Project    key.Binding
 	DateFilter key.Binding
+	Provider   key.Binding
+	Subagents  key.Binding
 	Sort       key.Binding
 	Help       key.Binding
 	PageUp     key.Binding
@@ -63,6 +65,14 @@ var keys = keyMap{
 	DateFilter: key.NewBinding(
 		key.WithKeys("d"),
 		key.WithHelp("d", "cycle date filter"),
+	),
+	Provider: key.NewBinding(
+		key.WithKeys("f"),
+		key.WithHelp("f", "cycle provider filter"),
+	),
+	Subagents: key.NewBinding(
+		key.WithKeys("a"),
+		key.WithHelp("a", "toggle subagent threads"),
 	),
 	Sort: key.NewBinding(
 		key.WithKeys("s"),

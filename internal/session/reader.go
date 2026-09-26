@@ -16,6 +16,12 @@ func containsType(line []byte, val string) bool {
 		strings.Contains(s, `"type": "`+val+`"`)
 }
 
+// hasCWD reports whether a raw line carries a non-null working directory.
+func hasCWD(line []byte) bool {
+	return strings.Contains(string(line), `"cwd":"`) ||
+		strings.Contains(string(line), `"cwd": "`)
+}
+
 // ExtractText pulls readable text from a message's Content field.
 func ExtractText(content interface{}) string {
 	switch v := content.(type) {
@@ -75,38 +81,53 @@ func ReadFirstUserPrompt(path string) (prompt string, cwd string, gitBranch stri
 
 	maxLines := 100 // look at first 100 lines (some sessions start with many file-history-snapshots)
 	for i := 0; i < maxLines && scanner.Scan(); i++ {
-		var msg Message
-		if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+		raw := scanner.Bytes()
+
+		// Parse the opening line, every user turn, and — until the working
+		// directory is known — any line that carries one. Transcripts often
+		// open with last-prompt/mode/permission-mode records whose cwd is null,
+		// so reading only line 0 leaves it empty and forces the caller to guess
+		// the project from its ambiguously encoded directory name.
+		if i > 0 && !containsType(raw, "user") && !(cwd == "" && hasCWD(raw)) {
 			continue
 		}
 
-		// Capture CWD and branch from first line
-		if i == 0 {
-			cwd = msg.CWD
-			gitBranch = msg.GitBranch
+		var msg Message
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			continue
+		}
+
+		if ts.IsZero() {
 			ts = msg.Timestamp
+		}
+		if cwd == "" && msg.CWD != "" {
+			cwd = msg.CWD
+		}
+		if gitBranch == "" && msg.GitBranch != "" {
+			gitBranch = msg.GitBranch
 		}
 
 		if msg.Type == "user" && msg.Message != nil && msg.Message.Role == "user" {
 			prompt = ExtractText(msg.Message.Content)
-			if ts.IsZero() {
-				ts = msg.Timestamp
+			// Keep scanning only if the working directory is still unknown;
+			// otherwise everything the caller needs is in hand.
+			if cwd != "" {
+				return
 			}
-			return
 		}
 	}
 	return
 }
 
-// ReadMessages reads up to maxMessages user/assistant messages from a JSONL file.
-func ReadMessages(path string, maxMessages int) ([]Message, error) {
+// ReadClaudeMessages reads up to maxMessages conversation turns from a Claude JSONL file.
+func ReadClaudeMessages(path string, maxMessages int) ([]PreviewMessage, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	var msgs []Message
+	var msgs []PreviewMessage
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 2*1024*1024), 2*1024*1024) // 2MB buffer
 
@@ -123,20 +144,33 @@ func ReadMessages(path string, maxMessages int) ([]Message, error) {
 			continue
 		}
 
-		if msg.Type == "user" || msg.Type == "assistant" {
-			msgs = append(msgs, msg)
-			if len(msgs) >= maxMessages {
-				break
-			}
+		if msg.Type != "user" && msg.Type != "assistant" {
+			continue
+		}
+		if msg.Message == nil {
+			continue
+		}
+		text := strings.TrimSpace(ExtractText(msg.Message.Content))
+		if text == "" {
+			continue
+		}
+
+		msgs = append(msgs, PreviewMessage{
+			Role:      msg.Message.Role,
+			Text:      text,
+			Timestamp: msg.Timestamp,
+		})
+		if len(msgs) >= maxMessages {
+			break
 		}
 	}
 
 	return msgs, scanner.Err()
 }
 
-// ReadAllText reads all user/assistant text content from a JSONL file.
+// ReadClaudeText reads all user/assistant text content from a Claude JSONL file.
 // Used for deep search.
-func ReadAllText(path string) ([]SearchableLine, error) {
+func ReadClaudeText(path string) ([]SearchableLine, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -180,12 +214,4 @@ func ReadAllText(path string) ([]SearchableLine, error) {
 	}
 
 	return lines, scanner.Err()
-}
-
-// SearchableLine is a text line extracted from a session for deep search.
-type SearchableLine struct {
-	Text      string
-	Role      string
-	Timestamp time.Time
-	LineNum   int
 }

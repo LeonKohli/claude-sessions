@@ -16,6 +16,8 @@ var (
 	colorHighlight = lipgloss.Color("#7C3AED") // highlight border
 	colorText      = lipgloss.Color("#E5E7EB") // main text
 	colorDimText   = lipgloss.Color("#9CA3AF") // dim text
+	colorClaude    = lipgloss.Color("#D97757") // Claude terracotta
+	colorCodex     = lipgloss.Color("#10A37F") // OpenAI green
 
 	// Panels
 	panelStyle = lipgloss.NewStyle().
@@ -122,5 +124,16 @@ var (
 	// Toast / notification
 	toastStyle = lipgloss.NewStyle().
 			Foreground(colorSuccess).
+			Bold(true)
+
+	// Provider badges
+	badgeClaudeStyle = lipgloss.NewStyle().
+				Foreground(colorBg).
+				Background(colorClaude).
+				Bold(true)
+
+	badgeCodexStyle = lipgloss.NewStyle().
+			Foreground(colorBg).
+			Background(colorCodex).
 			Bold(true)
 )

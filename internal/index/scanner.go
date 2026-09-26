@@ -4,22 +4,26 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/leon/claude-sessions/internal/session"
-	"github.com/leon/claude-sessions/internal/util"
+	"github.com/LeonKohli/claude-sessions/internal/provider"
+	"github.com/LeonKohli/claude-sessions/internal/session"
+	"github.com/LeonKohli/claude-sessions/internal/util"
 )
 
-// ScanAll walks ~/.claude/projects/ and builds a complete session index.
-func ScanAll() ([]session.SessionEntry, error) {
-	projectsDir := util.ClaudeProjectsDir()
+// ScanClaude walks ~/.claude/projects/ and builds the Claude half of the index.
+func ScanClaude() ([]session.SessionEntry, error) {
+	projectsDir := provider.ClaudeProjectsDir()
 	entries, err := os.ReadDir(projectsDir)
 	if err != nil {
 		return nil, err
 	}
 
 	var allSessions []session.SessionEntry
+	var uncovered []claudeScanJob
 	// Track which JSONL files are already covered by sessions-index.json
 	indexed := make(map[string]bool)
 
@@ -41,36 +45,68 @@ func ScanAll() ([]session.SessionEntry, error) {
 			}
 		}
 
-		// Scan for JSONL files not covered by the index (recursive walk)
+		// Queue JSONL files the index does not cover for a parallel pass.
 		filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
 			if err != nil || info.IsDir() {
 				return nil
 			}
-			if !strings.HasSuffix(path, ".jsonl") {
+			if !strings.HasSuffix(path, ".jsonl") || indexed[path] {
 				return nil
 			}
-			if indexed[path] {
-				return nil
-			}
-			base := filepath.Base(path)
-			if strings.HasPrefix(base, "agent-") {
-				return nil
-			}
-
-			s, err := scanJSONLFile(path, originalPath, dirName)
-			if err != nil {
-				return nil
-			}
-			// Skip empty sessions (no user messages, no summary)
-			if s.FirstPrompt == "" && s.Summary == "" {
-				return nil
-			}
-			allSessions = append(allSessions, s)
+			uncovered = append(uncovered, claudeScanJob{path: path, originalPath: originalPath, dirName: dirName})
 			return nil
 		})
 	}
 
-	return allSessions, nil
+	return append(allSessions, scanClaudeFiles(uncovered)...), nil
+}
+
+type claudeScanJob struct {
+	path         string
+	originalPath string
+	dirName      string
+}
+
+// scanClaudeFiles reads session headers concurrently. Subagent transcripts make
+// up well over half the store, so a serial pass here dominates the cold scan.
+func scanClaudeFiles(jobs []claudeScanJob) []session.SessionEntry {
+	if len(jobs) == 0 {
+		return nil
+	}
+
+	queue := make(chan claudeScanJob, len(jobs))
+	for _, j := range jobs {
+		queue <- j
+	}
+	close(queue)
+
+	results := make(chan session.SessionEntry, len(jobs))
+	var wg sync.WaitGroup
+	for i := 0; i < runtime.NumCPU(); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range queue {
+				s, err := scanJSONLFile(j.path, j.originalPath, j.dirName)
+				if err != nil {
+					continue
+				}
+				// Skip empty sessions (no user messages, no summary)
+				if s.FirstPrompt == "" && s.Summary == "" {
+					continue
+				}
+				results <- s
+			}
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	out := make([]session.SessionEntry, 0, len(jobs))
+	for s := range results {
+		out = append(out, s)
+	}
+	return out
 }
 
 // parseSessionsIndex reads a sessions-index.json and returns entries + originalPath.
@@ -87,10 +123,6 @@ func parseSessionsIndex(path, dirName string) ([]session.SessionEntry, string, e
 
 	var results []session.SessionEntry
 	for _, e := range idx.Entries {
-		if e.IsSidechain {
-			continue
-		}
-
 		// Skip ghost entries — file must actually exist on disk
 		info, err := os.Stat(e.FullPath)
 		if err != nil {
@@ -107,12 +139,8 @@ func parseSessionsIndex(path, dirName string) ([]session.SessionEntry, string, e
 
 		projectPath := util.ResolveProjectPath(idx.OriginalPath, e.ProjectPath, "", dirName)
 
-		shortID := e.SessionID
-		if len(shortID) > 8 {
-			shortID = shortID[:8]
-		}
-
 		results = append(results, session.SessionEntry{
+			Provider:     provider.Claude,
 			SessionID:    e.SessionID,
 			FullPath:     e.FullPath,
 			Summary:      e.Summary,
@@ -123,13 +151,39 @@ func parseSessionsIndex(path, dirName string) ([]session.SessionEntry, string, e
 			GitBranch:    e.GitBranch,
 			ProjectPath:  projectPath,
 			IsSidechain:  e.IsSidechain,
+			IsSubagent:   e.IsSidechain || isClaudeAgentFile(e.FullPath),
 			FileMtime:    int64(e.FileMtime),
 			FileSize:     info.Size(),
-			ShortID:      shortID,
+			ShortID:      shortID(e.SessionID),
 		})
 	}
 
 	return results, idx.OriginalPath, nil
+}
+
+// isClaudeAgentFile reports whether a transcript belongs to a spawned subagent
+// rather than a resumable top-level session.
+func isClaudeAgentFile(path string) bool {
+	return strings.HasPrefix(filepath.Base(path), "agent-")
+}
+
+// claudeSessionID derives a unique id from a transcript path.
+//
+// Subagent transcripts live at <parent>/subagents/agent-<id>.jsonl, and Claude
+// reuses the same agent id under different parents, so the bare filename is not
+// unique. Qualifying it with the parent session both disambiguates and records
+// which session spawned it.
+func claudeSessionID(path string) (id, parent string) {
+	base := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	if !isClaudeAgentFile(path) {
+		return base, ""
+	}
+	dir := filepath.Dir(path)
+	if filepath.Base(dir) != "subagents" {
+		return base, ""
+	}
+	parent = filepath.Base(filepath.Dir(dir))
+	return parent + "/" + base, parent
 }
 
 // scanJSONLFile extracts session metadata from a raw JSONL file.
@@ -141,15 +195,8 @@ func scanJSONLFile(path, originalPath, dirName string) (session.SessionEntry, er
 
 	prompt, cwd, gitBranch, ts := session.ReadFirstUserPrompt(path)
 
-	sessionID := filepath.Base(path)
-	sessionID = strings.TrimSuffix(sessionID, ".jsonl")
-
+	sessionID, parent := claudeSessionID(path)
 	projectPath := util.ResolveProjectPath(originalPath, "", cwd, dirName)
-
-	shortID := sessionID
-	if len(shortID) > 8 {
-		shortID = shortID[:8]
-	}
 
 	created := ts
 	if created.IsZero() {
@@ -157,6 +204,7 @@ func scanJSONLFile(path, originalPath, dirName string) (session.SessionEntry, er
 	}
 
 	return session.SessionEntry{
+		Provider:    provider.Claude,
 		SessionID:   sessionID,
 		FullPath:    path,
 		FirstPrompt: util.Truncate(util.CleanPrompt(prompt), 200),
@@ -164,8 +212,10 @@ func scanJSONLFile(path, originalPath, dirName string) (session.SessionEntry, er
 		Modified:    info.ModTime(),
 		GitBranch:   gitBranch,
 		ProjectPath: projectPath,
+		IsSubagent:  isClaudeAgentFile(path),
+		Parent:      parent,
 		FileMtime:   info.ModTime().UnixMilli(),
 		FileSize:    info.Size(),
-		ShortID:     shortID,
+		ShortID:     shortID(sessionID),
 	}, nil
 }

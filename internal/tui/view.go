@@ -8,8 +8,9 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/leon/claude-sessions/internal/session"
-	"github.com/leon/claude-sessions/internal/util"
+	"github.com/LeonKohli/claude-sessions/internal/provider"
+	"github.com/LeonKohli/claude-sessions/internal/session"
+	"github.com/LeonKohli/claude-sessions/internal/util"
 )
 
 func (m Model) View() string {
@@ -52,6 +53,12 @@ func (m Model) renderSearchBar() string {
 	}
 	if m.dateFilter != dateAll {
 		filterParts = append(filterParts, filterActiveStyle.Render("D:"+m.dateFilter.String()))
+	}
+	if m.providerFilter != providerAll {
+		filterParts = append(filterParts, filterActiveStyle.Render("F:"+m.providerFilter.String()))
+	}
+	if m.showSubagents {
+		filterParts = append(filterParts, filterActiveStyle.Render("+sub"))
 	}
 	filterParts = append(filterParts, statusDescStyle.Render("S:")+filterActiveStyle.Render(m.sortBy.String()))
 	filters := strings.Join(filterParts, " ")
@@ -116,8 +123,17 @@ func (m Model) renderList(w, h int) string {
 			shortID = s.SessionID[:8]
 		}
 
-		// Build right-side metadata
+		// Right-side metadata, ordered most to least worth keeping: a narrow
+		// pane drops from the tail, so the model survives longest.
 		var meta []string
+		if s.Model != "" {
+			meta = append(meta, s.Model)
+		}
+		if s.Enriched && s.TotalTokens() > 0 {
+			meta = append(meta, util.FormatTokens(s.TotalTokens())+"t")
+		} else if s.FileSize > 0 {
+			meta = append(meta, util.FormatSize(s.FileSize))
+		}
 		msgs := s.EstimatedMessages()
 		if msgs > 0 {
 			msgStr := strconv.Itoa(msgs) + "m"
@@ -126,64 +142,52 @@ func (m Model) renderList(w, h int) string {
 			}
 			meta = append(meta, msgStr)
 		}
-		dur := s.Duration()
-		if dur > 0 {
+		if dur := s.Duration(); dur > 0 {
 			meta = append(meta, util.FormatDuration(dur))
 		}
-		if s.Enriched && s.TotalTokens() > 0 {
-			meta = append(meta, util.FormatTokens(s.TotalTokens())+"t")
-		} else if s.FileSize > 0 {
-			meta = append(meta, util.FormatSize(s.FileSize))
-		}
-		if s.Model != "" {
-			meta = append(meta, s.Model)
-		}
 
-		metaStr := strings.Join(meta, " │ ")
-
-		// Line 2: project path
+		// Line 2: project path, plus the agent identity for spawned threads
 		project := shortPath(s.ProjectPath, innerW)
+		if s.IsSubagent {
+			label := s.AgentLabel
+			if label == "" {
+				label = "subagent"
+			}
+			project = shortPath(s.ProjectPath, innerW-len(label)-4) + "  ↳ " + label
+		}
 
 		// Line 3: title (summary or first prompt)
 		title := s.DisplayTitle()
 		title = util.Truncate(title, innerW-2)
 
-		var line1, line2, line3 string
+		indicator, timeStr, idStr := "  ", itemDateStyle.Render(relTime), itemTitleStyle.Render(shortID)
+		metaStyle := itemMetaDimStyle
 		if selected {
-			// Selected: highlighted
-			indicator := itemSelectedStyle.Render("▸ ")
-			timeStr := itemSelectedStyle.Render(relTime)
-			idStr := itemSelectedStyle.Render(shortID)
-			metaRendered := itemMetaStyle.Render(metaStr)
-			// Calculate padding between left and right
-			leftPart := indicator + timeStr + " " + idStr
-			leftW := lipgloss.Width(leftPart)
-			metaW := lipgloss.Width(metaRendered)
-			gap := innerW - leftW - metaW
-			if gap < 1 {
-				gap = 1
-			}
-			line1 = leftPart + strings.Repeat(" ", gap) + metaRendered
-			line2 = "  " + itemProjectStyle.Render(project)
-			line3 = "  " + itemPromptStyle.Render(title)
-		} else {
-			indicator := "  "
-			timeStr := itemDateStyle.Render(relTime)
-			idStr := itemTitleStyle.Render(shortID)
-			metaRendered := itemMetaDimStyle.Render(metaStr)
-			leftPart := indicator + timeStr + " " + idStr
-			leftW := lipgloss.Width(leftPart)
-			metaW := lipgloss.Width(metaRendered)
-			gap := innerW - leftW - metaW
-			if gap < 1 {
-				gap = 1
-			}
-			line1 = leftPart + strings.Repeat(" ", gap) + metaRendered
-			line2 = "  " + itemProjectStyle.Render(project)
-			line3 = "  " + itemPromptStyle.Render(title)
+			indicator = itemSelectedStyle.Render("▸ ")
+			timeStr = itemSelectedStyle.Render(relTime)
+			idStr = itemSelectedStyle.Render(shortID)
+			metaStyle = itemMetaStyle
 		}
 
-		lines = append(lines, line1, line2, line3)
+		leftPart := indicator + timeStr + " " + idStr + " " + providerBadge(s.Provider)
+		// Each entry occupies exactly three lines, so line one must never wrap.
+		// Drop metadata from the right, least important first, until it fits.
+		budget := innerW - lipgloss.Width(leftPart) - 1
+		for len(meta) > 0 && lipgloss.Width(strings.Join(meta, " │ ")) > budget {
+			meta = meta[:len(meta)-1]
+		}
+		metaRendered := metaStyle.Render(strings.Join(meta, " │ "))
+
+		gap := innerW - lipgloss.Width(leftPart) - lipgloss.Width(metaRendered)
+		if gap < 1 {
+			gap = 1
+		}
+
+		lines = append(lines,
+			leftPart+strings.Repeat(" ", gap)+metaRendered,
+			"  "+itemProjectStyle.Render(project),
+			"  "+itemPromptStyle.Render(title),
+		)
 	}
 
 	content := strings.Join(lines, "\n")
@@ -213,8 +217,12 @@ func (m Model) renderPreview(w, h int) string {
 	innerW := w - 4
 	var lines []string
 
-	// Header: Session UUID
-	lines = append(lines, previewHeaderStyle.Render(s.SessionID))
+	// Header: session UUID + which agent it belongs to. The shared header style
+	// carries a bottom margin, which would push the badge onto its own line, so
+	// the blank separator is appended explicitly instead.
+	lines = append(lines,
+		previewHeaderStyle.MarginBottom(0).Render(s.SessionID)+" "+providerBadge(s.Provider),
+		"")
 
 	// Metadata section
 	addField := func(label, value string) {
@@ -226,6 +234,19 @@ func (m Model) renderPreview(w, h int) string {
 	addField("Project:  ", s.ProjectPath)
 	if s.GitBranch != "" {
 		addField("Branch:   ", s.GitBranch)
+	}
+	if s.IsSubagent {
+		label := s.AgentLabel
+		if label == "" {
+			label = "subagent"
+		}
+		if s.Provider == provider.Claude {
+			label += "  (not resumable)"
+		}
+		addField("Agent:    ", label)
+	}
+	if s.Archived {
+		addField("State:    ", "archived")
 	}
 
 	// Time row: created → modified (duration)
@@ -341,31 +362,17 @@ func (m Model) renderPreview(w, h int) string {
 			if shown >= maxMsgs {
 				break
 			}
-			if msg.Message == nil {
-				continue
-			}
-			text := session.ExtractText(msg.Message.Content)
-			text = strings.TrimSpace(text)
+			text := util.Truncate(util.CleanPrompt(msg.Text), innerW-14)
 			if text == "" {
 				continue
 			}
-			text = util.CleanPrompt(text)
-			text = util.Truncate(text, innerW-14)
-			ts := msg.Timestamp.Format("15:04")
 
-			var roleStyle lipgloss.Style
-			if msg.Message.Role == "user" {
-				roleStyle = previewRoleUser
-			} else {
-				roleStyle = previewRoleAssistant
+			roleStyle, tag := previewRoleAssistant, "[ast]"
+			if msg.Role == "user" {
+				roleStyle, tag = previewRoleUser, "[usr]"
 			}
 
-			tag := "[usr]"
-			if msg.Message.Role == "assistant" {
-				tag = "[ast]"
-			}
-
-			prefix := roleStyle.Render(tag+" "+ts+" ")
+			prefix := roleStyle.Render(tag + " " + msg.Timestamp.Format("15:04") + " ")
 			lines = append(lines, prefix+previewMsgText.Render(text))
 			shown++
 		}
@@ -376,6 +383,14 @@ func (m Model) renderPreview(w, h int) string {
 
 	content := strings.Join(lines, "\n")
 	return panelStyle.Width(w).Height(h - 2).Render(content)
+}
+
+// providerBadge renders the agent tag shown beside a session.
+func providerBadge(k provider.Kind) string {
+	if k == provider.Codex {
+		return badgeCodexStyle.Render(" " + k.Badge() + " ")
+	}
+	return badgeClaudeStyle.Render(" " + k.Badge() + " ")
 }
 
 // shortPath makes a path displayable: ~/proj or ~/Documents/proj
@@ -408,6 +423,8 @@ func (m Model) renderStatusBar() string {
 		statusKeyStyle.Render("s") + statusDescStyle.Render(" sort"),
 		statusKeyStyle.Render("p") + statusDescStyle.Render(" project"),
 		statusKeyStyle.Render("d") + statusDescStyle.Render(" date"),
+		statusKeyStyle.Render("f") + statusDescStyle.Render(" agent"),
+		statusKeyStyle.Render("a") + statusDescStyle.Render(" subagents"),
 		statusKeyStyle.Render("⏎") + statusDescStyle.Render(" resume"),
 		statusKeyStyle.Render("y") + statusDescStyle.Render(" copy"),
 		statusKeyStyle.Render("q") + statusDescStyle.Render(" quit"),
