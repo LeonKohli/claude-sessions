@@ -7,11 +7,6 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
-    env:
-      CLAUDE_CONFIG_DIR: ${{ runner.temp }}/claude-fixtures
-      CODEX_HOME: ${{ runner.temp }}/codex-fixtures
-      CODEX_SQLITE_HOME: ${{ runner.temp }}/codex-sqlite-fixtures
-      XDG_CACHE_HOME: ${{ runner.temp }}/agent-cache
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -20,8 +15,15 @@ jobs:
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
-      - run: go test ./...
-      - run: go vet ./...
+      - name: Test and vet
+        env:
+          CLAUDE_CONFIG_DIR: ${{ runner.temp }}/claude-fixtures
+          CODEX_HOME: ${{ runner.temp }}/codex-fixtures
+          CODEX_SQLITE_HOME: ${{ runner.temp }}/codex-sqlite-fixtures
+          XDG_CACHE_HOME: ${{ runner.temp }}/agent-cache
+        run: |
+          go test ./...
+          go vet ./...
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           version: v2.18.2
