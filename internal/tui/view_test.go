@@ -1,15 +1,98 @@
 package tui
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/LeonKohli/claude-sessions/internal/provider"
 	"github.com/LeonKohli/claude-sessions/internal/session"
 )
+
+func TestSelectionStaysVisibleAfterScrollingAndResizing(t *testing.T) {
+	var entries []session.SessionEntry
+	for i := 0; i < 9; i++ {
+		id := fmt.Sprintf("session-%d", i)
+		entries = append(entries, session.SessionEntry{SessionID: id, ShortID: id, FirstPrompt: id, Modified: time.Unix(int64(100-i), 0)})
+	}
+	next, _ := NewModel(entries).Update(tea.WindowSizeMsg{Width: 160, Height: 24})
+	m := next.(Model)
+	for i := 0; i < 5; i++ {
+		m = press(t, m, "j")
+	}
+	for _, height := range []int{24, 18} {
+		next, _ = m.Update(tea.WindowSizeMsg{Width: 160, Height: height})
+		m = next.(Model)
+		visible := false
+		for _, line := range strings.Split(m.View().Content, "\n") {
+			if strings.Contains(line, "▸") && strings.Contains(line, "session-5") {
+				visible = true
+			}
+		}
+		if !visible {
+			t.Fatalf("selected session disappeared at height %d:\n%s", height, m.View().Content)
+		}
+	}
+}
+
+func TestPreviewReportsMissingTranscript(t *testing.T) {
+	entry := session.SessionEntry{SessionID: "missing", FirstPrompt: "missing transcript", FullPath: filepath.Join(t.TempDir(), "missing.jsonl")}
+	next, load := NewModel([]session.SessionEntry{entry}).Update(tea.WindowSizeMsg{Width: 160, Height: 24})
+	m := next.(Model)
+	if !strings.Contains(m.View().Content, "Loading") {
+		t.Fatal("pending preview was shown as empty")
+	}
+	if load == nil {
+		t.Fatal("preview did not start")
+	}
+	next, _ = m.Update(load())
+	view := next.(Model).View().Content
+	if !strings.Contains(view, "missing.jsonl") || !strings.Contains(view, "Preview unavailable") {
+		t.Fatalf("missing transcript was shown as empty:\n%s", view)
+	}
+}
+
+func TestPreviewUpdatesDisplayedUsage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.jsonl")
+	body := `{"type":"user","message":{"role":"user","content":"question"}}
+{"type":"assistant","message":{"id":"one","role":"assistant","usage":{"input_tokens":3,"output_tokens":11},"content":[{"type":"thinking","thinking":"reasoning"}]}}
+{"type":"assistant","message":{"id":"one","role":"assistant","usage":{"input_tokens":3,"output_tokens":11},"content":[{"type":"text","text":"answer"}]}}
+`
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	entry := session.SessionEntry{SessionID: "usage", FirstPrompt: "usage", FullPath: path, FileSize: 3000}
+	next, load := NewModel([]session.SessionEntry{entry}).Update(tea.WindowSizeMsg{Width: 160, Height: 24})
+	m := next.(Model)
+	if load == nil {
+		t.Fatal("preview did not start")
+	}
+	next, _ = m.Update(load())
+	view := next.(Model).View().Content
+	if !strings.Contains(view, "2 messages") || !strings.Contains(view, "14t") {
+		t.Fatalf("display kept estimated counts after loading:\n%s", view)
+	}
+}
+
+func TestCompletedEmptyTranscriptReplacesEstimatedMessageCount(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "empty.jsonl")
+	if err := os.WriteFile(path, []byte("{\"type\":\"summary\"}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	entry := session.SessionEntry{SessionID: "empty", Summary: "Empty conversation", FullPath: path, FileSize: 90000, MessageCount: 8}
+	next, load := NewModel([]session.SessionEntry{entry}).Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m := finishCommands(next.(Model), load)
+	view := m.View().Content
+	if !strings.Contains(view, "0 messages") || strings.Contains(view, "8 messages") || strings.Contains(view, "~30 messages") {
+		t.Fatalf("completed scan retained an old count or estimate:\n%s", view)
+	}
+}
 
 func fixtures() []session.SessionEntry {
 	now := time.Now()
@@ -48,7 +131,7 @@ func sized(m Model) Model {
 
 func press(t *testing.T, m Model, key string) Model {
 	t.Helper()
-	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+	next, _ := m.Update(tea.KeyPressMsg{Text: key})
 	return next.(Model)
 }
 
@@ -70,40 +153,33 @@ func TestSubagentsHiddenUntilToggled(t *testing.T) {
 	}
 }
 
-func TestProviderFilterCycles(t *testing.T) {
+func TestProviderFilterChoosesAgentByName(t *testing.T) {
 	m := sized(NewModel(fixtures()))
-
-	m = press(t, m, "f") // all -> claude
-	if got := m.providerFilter.String(); got != "claude" {
-		t.Fatalf("filter = %q, want claude", got)
-	}
-	for _, s := range m.filtered {
-		if s.Provider != provider.Claude {
-			t.Errorf("claude filter leaked a %s session", s.Provider)
+	for _, choice := range []string{"claude", "codex", "all"} {
+		m = press(t, m, "f")
+		m = press(t, m, choice)
+		next, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+		m = next.(Model)
+		if m.providerFilter.String() != choice {
+			t.Fatalf("selected %s, got %s", choice, m.providerFilter.String())
 		}
-	}
-
-	m = press(t, m, "f") // claude -> codex
-	if got := m.providerFilter.String(); got != "codex" {
-		t.Fatalf("filter = %q, want codex", got)
-	}
-	for _, s := range m.filtered {
-		if s.Provider != provider.Codex {
-			t.Errorf("codex filter leaked a %s session", s.Provider)
+		if choice == "all" {
+			if len(m.filtered) != 2 {
+				t.Fatal("clearing the filter did not return both sessions")
+			}
+			continue
 		}
-	}
-
-	m = press(t, m, "f") // codex -> all
-	if m.providerFilter != providerAll || len(m.filtered) != 2 {
-		t.Errorf("cycle did not return to all: %v, %d entries", m.providerFilter, len(m.filtered))
+		if len(m.filtered) != 1 || m.filtered[0].Provider.String() != choice {
+			t.Fatalf("%s filter returned the wrong sessions", choice)
+		}
 	}
 }
 
 func TestViewRendersBothProviders(t *testing.T) {
 	m := sized(NewModel(fixtures()))
-	out := m.View()
+	out := m.View().Content
 
-	for _, want := range []string{"cc", "cx", "Audit the repository", "Fix auth middleware", "Search:"} {
+	for _, want := range []string{"Claude", "Codex", "Audit the repository", "Fix auth middleware", "Search:"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("rendered view is missing %q", want)
 		}
@@ -115,7 +191,7 @@ func TestViewRendersBothProviders(t *testing.T) {
 
 func TestViewRendersAgentLabel(t *testing.T) {
 	m := press(t, sized(NewModel(fixtures())), "a")
-	if out := m.View(); !strings.Contains(out, "Wegener/explorer") {
+	if out := m.View().Content; !strings.Contains(out, "Wegener/explorer") {
 		t.Error("revealed subagent is missing its agent label")
 	}
 }
@@ -124,7 +200,7 @@ func TestViewRendersAgentLabel(t *testing.T) {
 // directory, and must refuse Claude subagent transcripts outright.
 func TestResumeTargetsTheOwningAgent(t *testing.T) {
 	m := press(t, sized(NewModel(fixtures())), "\r")
-	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	next, _ := m.Update(tea.KeyPressMsg{Text: "r"})
 	m = next.(Model)
 
 	if m.resumeProvider != provider.Codex {
@@ -153,7 +229,7 @@ func TestClaudeSubagentIsNotResumable(t *testing.T) {
 		t.Fatalf("fixture ordering changed: cursor is on %+v", s)
 	}
 
-	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	next, cmd := m.Update(tea.KeyPressMsg{Text: "r"})
 	m = next.(Model)
 	if m.resumeSessionID != "" {
 		t.Error("a Claude subagent transcript was accepted for resume")
@@ -194,13 +270,128 @@ func TestViewSurvivesTinyTerminal(t *testing.T) {
 		m = next.(Model)
 		m.showSubagents = true
 		m.applyFilters()
-		_ = m.View()
+		_ = m.View().Content
 	}
 }
 
 func TestViewWithNoSessions(t *testing.T) {
 	m := sized(NewModel(nil))
-	if out := m.View(); !strings.Contains(out, "No sessions found") {
+	if out := m.View().Content; !strings.Contains(out, "No sessions found") {
 		t.Error("empty state not rendered")
+	}
+}
+
+func TestDeepSearchRejectsStaleResultsAndRefreshesSelection(t *testing.T) {
+	m := sized(NewModel(fixtures()))
+	m.searchMode = searchDeep
+	m.searchInput.SetValue("current")
+	_ = m.runDeepSearch("current")
+	id := m.debounceID
+	m.scrollOffset = 5
+	result := DeepSearchResultMsg{ID: id, Query: "current", Results: []DeepMatch{{Session: fixtures()[1]}}}
+	next, cmd := m.Update(result)
+	m = next.(Model)
+	if cmd == nil || m.previewSessID != fixtures()[1].SessionID || m.scrollOffset != 0 {
+		t.Fatal("accepted results did not refresh selection and preview")
+	}
+	result.ID--
+	result.Results = []DeepMatch{{Session: fixtures()[0]}}
+	next, _ = m.Update(result)
+	m = next.(Model)
+	if len(m.filtered) != 1 || m.filtered[0].SessionID != fixtures()[1].SessionID {
+		t.Fatal("stale results replaced the current results")
+	}
+	next, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
+	m = next.(Model)
+	result.ID = id
+	next, _ = m.Update(result)
+	m = next.(Model)
+	if m.searchInput.Value() != "" || len(m.filtered) != 2 {
+		t.Fatal("search completion undid Escape")
+	}
+}
+
+func TestControlCQuitsWhileSearching(t *testing.T) {
+	m := sized(NewModel(fixtures()))
+	m.searchActive = true
+	_, cmd := m.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
+	if cmd == nil {
+		t.Fatal("Ctrl+C ignored")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Fatal("Ctrl+C did not quit")
+	}
+}
+
+func TestDeepSearchDisplaysTranscriptMatches(t *testing.T) {
+	entries := fixtures()[:2]
+	for i := range entries {
+		entries[i].FullPath = filepath.Join(t.TempDir(), "session.jsonl")
+		entries[i].Provider = provider.Claude
+		body := `{"type":"user","message":{"role":"user","content":"ordinary conversation"}}` + "\n"
+		if i == 1 {
+			body = `{"type":"user","message":{"role":"user","content":"needle in the transcript"}}` + "\n"
+		}
+		if err := os.WriteFile(entries[i].FullPath, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := press(t, sized(NewModel(entries)), "/")
+	m = press(t, m, "needle")
+	next, cmd := m.Update(tea.KeyPressMsg{Code: 's', Mod: tea.ModCtrl})
+	m = next.(Model)
+	if cmd == nil {
+		t.Fatal("switching to transcript search did not start a search")
+	}
+	next, _ = m.Update(cmd())
+	m = next.(Model)
+	view := m.View().Content
+	for _, want := range []string{"Fix auth middleware", "needle in the transcript"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("completed transcript search did not display %q", want)
+		}
+	}
+	if strings.Contains(view, "Audit the repository") {
+		t.Error("completed transcript search retained the nonmatching session")
+	}
+}
+
+func TestLongSearchKeepsTheEditedEndVisible(t *testing.T) {
+	next, _ := NewModel(fixtures()).Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m := press(t, next.(Model), "/")
+	height := lipgloss.Height(m.renderSearchBar())
+	m = press(t, m, strings.Repeat("earlier ", 12)+"latest")
+	if lipgloss.Height(m.renderSearchBar()) != height {
+		t.Fatalf("long query expanded from %d to %d:\n%s", height, lipgloss.Height(m.renderSearchBar()), m.renderSearchBar())
+	}
+	if !strings.Contains(m.View().Content, "latest") {
+		t.Fatalf("the query's edited end disappeared:\n%s", m.View().Content)
+	}
+}
+
+func TestEmptySearchFitsShortWindow(t *testing.T) {
+	next, _ := NewModel(fixtures()).Update(tea.WindowSizeMsg{Width: 80, Height: 18})
+	m := press(t, next.(Model), "/")
+	m = press(t, m, "no matching session")
+	view := m.View().Content
+	if lipgloss.Height(view) > 18 || lipgloss.Width(view) > 80 {
+		t.Fatalf("empty search overflows terminal: %dx%d", lipgloss.Width(view), lipgloss.Height(view))
+	}
+}
+
+func TestMetadataCannotSendTerminalCommandsOrOverflowStatus(t *testing.T) {
+	control := "\x1b]52;c;Y2xpcGJvYXJk\x07"
+	entries := fixtures()[:1]
+	entries[0].Model = "model" + control
+	m := sized(NewModel(entries))
+	m.previewLoading = false
+	next, _ := m.Update(ToastMsg{Text: "failed " + control + strings.Repeat("long-path/", 30)})
+	m = next.(Model)
+	view := m.View().Content
+	if strings.Contains(view, control) {
+		t.Fatal("untrusted metadata emitted a terminal command")
+	}
+	if lipgloss.Width(m.renderSearchBar()) > m.width {
+		t.Fatal("long error expanded the status bar beyond the terminal")
 	}
 }

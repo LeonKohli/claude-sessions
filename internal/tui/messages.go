@@ -4,20 +4,20 @@ import (
 	"github.com/LeonKohli/claude-sessions/internal/session"
 )
 
-// SessionsLoadedMsg is sent when the session index is ready.
-type SessionsLoadedMsg struct {
-	Sessions []session.SessionEntry
-}
-
 // PreviewLoadedMsg is sent when session preview data is ready.
 type PreviewLoadedMsg struct {
-	SessionID  string
-	Messages   []session.PreviewMessage
-	Enrichment *session.EnrichmentData
+	Request     uint64
+	ReferenceID string
+	Messages    []session.PreviewMessage
+	Enrichment  *session.EnrichmentData
+	Files       []session.FileChange
+	FilesErr    error
+	Err         error
 }
 
 // DeepSearchResultMsg carries results from deep content search.
 type DeepSearchResultMsg struct {
+	ID      int
 	Query   string
 	Results []DeepMatch
 	Err     error

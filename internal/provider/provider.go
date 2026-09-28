@@ -29,16 +29,6 @@ func (k Kind) String() string {
 	}
 }
 
-// Badge is the short tag shown next to a session in the list.
-func (k Kind) Badge() string {
-	switch k {
-	case Codex:
-		return "cx"
-	default:
-		return "cc"
-	}
-}
-
 // ResumeArgv returns the binary name and argv that reopen a session.
 // Both agents accept the session UUID directly.
 func (k Kind) ResumeArgv(sessionID string) (bin string, argv []string) {
@@ -48,19 +38,6 @@ func (k Kind) ResumeArgv(sessionID string) (bin string, argv []string) {
 	default:
 		return "claude", []string{"claude", "--resume", sessionID}
 	}
-}
-
-// Available reports whether this provider has a transcript store on disk.
-func (k Kind) Available() bool {
-	var dir string
-	switch k {
-	case Codex:
-		dir = CodexSessionsDir()
-	default:
-		dir = ClaudeProjectsDir()
-	}
-	info, err := os.Stat(dir)
-	return err == nil && info.IsDir()
 }
 
 func userHome() string {

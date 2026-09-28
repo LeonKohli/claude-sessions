@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/LeonKohli/claude-sessions/internal/cli"
 	"github.com/LeonKohli/claude-sessions/internal/index"
@@ -29,10 +29,10 @@ func runBrowser() int {
 	flag.Parse()
 
 	kinds := provider.All
-	switch {
-	case *claudeOnly && !*codexOnly:
+	switch cli.ProviderFilter("", *claudeOnly, *codexOnly) {
+	case "claude":
 		kinds = []provider.Kind{provider.Claude}
-	case *codexOnly && !*claudeOnly:
+	case "codex":
 		kinds = []provider.Kind{provider.Codex}
 	}
 
@@ -47,7 +47,7 @@ func runBrowser() int {
 		return 1
 	}
 
-	p := tea.NewProgram(tui.NewModel(sessions), tea.WithAltScreen())
+	p := tea.NewProgram(tui.NewModel(sessions))
 	finalModel, err := p.Run()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -56,7 +56,10 @@ func runBrowser() int {
 
 	// Post-quit: if the user selected a session, exec into its agent.
 	if fm, ok := finalModel.(tui.Model); ok {
-		fm.ExecResume()
+		if err := fm.ExecResume(); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			return 1
+		}
 	}
 	return 0
 }

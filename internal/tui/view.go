@@ -1,108 +1,129 @@
 package tui
 
 import (
+	tea "charm.land/bubbletea/v2"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/help"
+	"charm.land/bubbles/v2/key"
+	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/LeonKohli/claude-sessions/internal/provider"
 	"github.com/LeonKohli/claude-sessions/internal/session"
 	"github.com/LeonKohli/claude-sessions/internal/util"
 )
 
-func (m Model) View() string {
+func (m Model) View() tea.View {
+	content := m.render()
+	if m.menu != nil && m.width >= 40 && m.height >= 18 {
+		content = m.renderMenu(content)
+	}
+	v := tea.NewView(content)
+	v.AltScreen = true
+	return v
+}
+
+func (m Model) render() string {
 	if m.width == 0 || m.height == 0 {
 		return "Loading..."
 	}
 
+	if m.width < 40 || m.height < 18 {
+		return "Enlarge terminal to at least 40 × 18"
+	}
+	if m.files != nil {
+		return m.renderFiles()
+	}
+	if m.reader != nil {
+		return m.renderReader()
+	}
 	searchBar := m.renderSearchBar()
 	statusBar := m.renderStatusBar()
 
-	searchH := lipgloss.Height(searchBar)
-	statusH := lipgloss.Height(statusBar)
-	panelH := m.height - searchH - statusH
+	leftW, rightW, listH, previewH := m.panelDimensions()
 
-	// 45/55 split — give preview more room for the rich data
-	leftW := m.width*45/100 - 2
-	rightW := m.width - leftW - 4
-
-	leftPanel := m.renderList(leftW, panelH)
-	rightPanel := m.renderPreview(rightW, panelH)
+	if m.width < 90 {
+		return lipgloss.JoinVertical(lipgloss.Left, searchBar, m.renderList(leftW, listH), m.renderPreview(rightW, previewH), statusBar)
+	}
+	leftPanel := m.renderList(leftW, listH)
+	rightPanel := m.renderPreview(rightW, previewH)
 
 	panels := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, rightPanel)
 
 	return lipgloss.JoinVertical(lipgloss.Left, searchBar, panels, statusBar)
 }
 
+func (m Model) panelDimensions() (listW, previewW, listH, previewH int) {
+	h := m.height - lipgloss.Height(m.renderSearchBar()) - lipgloss.Height(m.renderStatusBar())
+	if m.width < 90 {
+		return m.width, m.width, 7, h - 7
+	}
+	listW = m.width * 44 / 100
+	return listW, m.width - listW, h, h
+}
+
 func (m Model) renderSearchBar() string {
-	w := m.width - 4
-
-	modeStr := " fuzzy "
-	if m.searchMode == searchDeep {
-		modeStr = " deep "
+	count := strconv.Itoa(len(m.filtered)) + " / " + strconv.Itoa(len(m.allSessions)) + " sessions"
+	if m.deepSearching {
+		count = "Searching transcripts…"
 	}
-	mode := searchModeStyle.Render(modeStr)
-
-	var filterParts []string
+	if m.toast != "" {
+		count = m.toast
+	}
+	heading := m.theme.searchLabelStyle.Render("agent-sessions")
+	count = clipLine(count, m.width-3-lipgloss.Width(heading))
+	top := heading + strings.Repeat(" ", max(1, m.width-2-lipgloss.Width(heading)-lipgloss.Width(count))) + m.theme.statusDescStyle.Render(count)
+	mode := m.theme.statusDescStyle.Render("titles") + "  " + m.theme.searchModeStyle.Render("[transcript]")
+	if m.searchMode == searchFuzzy {
+		mode = m.theme.searchModeStyle.Render("[titles]") + "  " + m.theme.statusDescStyle.Render("transcript")
+	}
+	input := m.searchInput
+	input.SetWidth(m.searchFieldWidth())
+	row := m.theme.searchLabelStyle.Render("Search: ") + lipgloss.NewStyle().Width(input.Width()+1).Render(input.View()) + "  " + mode
+	style := m.theme.searchBarStyle
+	if m.searchActive {
+		style = m.theme.activePanelStyle
+	}
+	filters := []string{"sort: " + m.sortBy.String()}
 	if m.projectFilter != "" {
-		short := filepath.Base(m.projectFilter)
-		filterParts = append(filterParts, filterActiveStyle.Render("P:"+short))
-	}
-	if m.dateFilter != dateAll {
-		filterParts = append(filterParts, filterActiveStyle.Render("D:"+m.dateFilter.String()))
+		filters = append(filters, "project: "+filepath.Base(m.projectFilter))
 	}
 	if m.providerFilter != providerAll {
-		filterParts = append(filterParts, filterActiveStyle.Render("F:"+m.providerFilter.String()))
+		filters = append(filters, "agent: "+m.providerFilter.String())
+	}
+	if m.dateFilter != dateAll {
+		filters = append(filters, "date: "+m.dateFilter.String())
 	}
 	if m.showSubagents {
-		filterParts = append(filterParts, filterActiveStyle.Render("+sub"))
+		filters = append(filters, "subagents shown")
 	}
-	filterParts = append(filterParts, statusDescStyle.Render("S:")+filterActiveStyle.Render(m.sortBy.String()))
-	filters := strings.Join(filterParts, " ")
-
-	label := searchLabelStyle.Render("Search: ")
-	searchField := m.searchInput.View()
-
-	countStr := statusDescStyle.Render(
-		" " + strconv.Itoa(len(m.filtered)) + "/" + strconv.Itoa(len(m.allSessions)))
-
-	if m.deepSearching {
-		countStr = filterActiveStyle.Render(" searching...")
-	}
-
-	if m.toast != "" {
-		countStr = toastStyle.Render(" " + m.toast)
-	}
-
-	right := mode + " " + filters + countStr
-	leftSpace := w - lipgloss.Width(label) - lipgloss.Width(right) - 2
-	if leftSpace < 10 {
-		leftSpace = 10
-	}
-
-	inputStyle := lipgloss.NewStyle().Width(leftSpace)
-	row := label + inputStyle.Render(searchField) + " " + right
-
-	return searchBarStyle.Width(m.width - 2).Render(row)
+	return lipgloss.JoinVertical(lipgloss.Left, " "+top, style.Border(lipgloss.Border{}).Padding(0, 1).Width(m.width).Render(row), " "+m.theme.statusDescStyle.Render(clipLine(strings.Join(filters, "   "), m.width-2)))
 }
+
+func (m Model) searchFieldWidth() int { return max(1, m.width-39) }
 
 func (m Model) renderList(w, h int) string {
 	if h < 4 {
 		h = 4
 	}
 
-	itemH := 3
-	visibleItems := (h - 2) / itemH
+	itemH, headerH := m.listItemHeight(), 1
+	if m.width < 90 {
+		headerH = 1
+	}
+	visibleItems := max(1, (h-2-headerH)/itemH)
 
 	if len(m.filtered) == 0 {
 		empty := lipgloss.NewStyle().
-			Foreground(colorMuted).
-			Padding(2, 2).
+			Foreground(m.theme.colorMuted).
+			Padding(1, 1).
 			Render("No sessions found")
-		return panelStyle.Width(w).Height(h - 2).Render(empty)
+		return m.theme.panelStyle.Width(w).Height(h).Render(empty)
 	}
 
 	end := m.scrollOffset + visibleItems
@@ -110,130 +131,107 @@ func (m Model) renderList(w, h int) string {
 		end = len(m.filtered)
 	}
 
-	var lines []string
+	heading := m.theme.statusDescStyle.Render("Sessions")
+	if m.width >= 90 {
+		heading = "Sessions · Enter read"
+		if !m.searchActive && !m.previewFocused {
+			heading = "Sessions · focused"
+		}
+	}
+	lines := []string{heading}
 	for i := m.scrollOffset; i < end; i++ {
 		s := m.filtered[i]
 		selected := i == m.cursor
-		innerW := w - 4 // border + padding
-
-		// Line 1: relative time | short ID | model badge | msg count | duration
-		relTime := util.RelativeTime(s.Modified)
-		shortID := s.ShortID
-		if shortID == "" && len(s.SessionID) >= 8 {
-			shortID = s.SessionID[:8]
+		innerW := max(1, w-4)
+		badge := m.providerBadge(s.Provider)
+		titleW := max(1, innerW-lipgloss.Width(badge)-3)
+		marker := "  "
+		titleStyle, detailStyle := m.theme.itemTitleStyle, m.theme.itemDateStyle
+		if selected {
+			marker = "▸ "
+			titleStyle = titleStyle.Background(m.theme.colorBgPanel)
+			detailStyle = detailStyle.Background(m.theme.colorBgPanel)
 		}
-
-		// Right-side metadata, ordered most to least worth keeping: a narrow
-		// pane drops from the tail, so the model survives longest.
-		var meta []string
-		if s.Model != "" {
-			meta = append(meta, s.Model)
-		}
-		if s.Enriched && s.TotalTokens() > 0 {
-			meta = append(meta, util.FormatTokens(s.TotalTokens())+"t")
-		} else if s.FileSize > 0 {
-			meta = append(meta, util.FormatSize(s.FileSize))
-		}
-		msgs := s.EstimatedMessages()
-		if msgs > 0 {
-			msgStr := strconv.Itoa(msgs) + "m"
-			if s.MessageCount == 0 {
-				msgStr = "~" + msgStr // estimated
-			}
-			meta = append(meta, msgStr)
-		}
-		if dur := s.Duration(); dur > 0 {
-			meta = append(meta, util.FormatDuration(dur))
-		}
-
-		// Line 2: project path, plus the agent identity for spawned threads
-		project := shortPath(s.ProjectPath, innerW)
+		title := titleStyle.Width(titleW).Render(clipLine(s.DisplayTitle(), titleW))
+		project := shortPath(s.ProjectPath, innerW-15)
 		if s.IsSubagent {
 			label := s.AgentLabel
 			if label == "" {
 				label = "subagent"
 			}
-			project = shortPath(s.ProjectPath, innerW-len(label)-4) + "  ↳ " + label
+			project = label + " · " + project
 		}
-
-		// Line 3: title (summary or first prompt)
-		title := s.DisplayTitle()
-		title = util.Truncate(title, innerW-2)
-
-		indicator, timeStr, idStr := "  ", itemDateStyle.Render(relTime), itemTitleStyle.Render(shortID)
-		metaStyle := itemMetaDimStyle
-		if selected {
-			indicator = itemSelectedStyle.Render("▸ ")
-			timeStr = itemSelectedStyle.Render(relTime)
-			idStr = itemSelectedStyle.Render(shortID)
-			metaStyle = itemMetaStyle
+		age := util.RelativeTime(s.Modified)
+		detail := clipLine(project, innerW-lipgloss.Width(age)-4)
+		detail = "  " + detail + strings.Repeat(" ", max(1, innerW-2-lipgloss.Width(detail)-lipgloss.Width(age))) + age
+		lines = append(lines, titleStyle.Render(marker)+badge+" "+title, detailStyle.Width(innerW).Render(detail))
+		if itemH == 3 {
+			snippet := ""
+			if hits := m.deepResults[s.ReferenceID()]; len(hits) > 0 {
+				snippet = hits[0]
+			}
+			lines = append(lines, m.theme.filterActiveStyle.Render(clipLine("  ↳ "+snippet, innerW)))
 		}
-
-		leftPart := indicator + timeStr + " " + idStr + " " + providerBadge(s.Provider)
-		// Each entry occupies exactly three lines, so line one must never wrap.
-		// Drop metadata from the right, least important first, until it fits.
-		budget := innerW - lipgloss.Width(leftPart) - 1
-		for len(meta) > 0 && lipgloss.Width(strings.Join(meta, " │ ")) > budget {
-			meta = meta[:len(meta)-1]
-		}
-		metaRendered := metaStyle.Render(strings.Join(meta, " │ "))
-
-		gap := innerW - lipgloss.Width(leftPart) - lipgloss.Width(metaRendered)
-		if gap < 1 {
-			gap = 1
-		}
-
-		lines = append(lines,
-			leftPart+strings.Repeat(" ", gap)+metaRendered,
-			"  "+itemProjectStyle.Render(project),
-			"  "+itemPromptStyle.Render(title),
-		)
 	}
 
 	content := strings.Join(lines, "\n")
 
-	style := panelStyle
-	if !m.searchActive {
-		style = activePanelStyle
+	style := m.theme.panelStyle
+	if !m.searchActive && !m.previewFocused {
+		style = m.theme.activePanelStyle
 	}
 
-	return style.Width(w).Height(h - 2).Render(content)
+	return style.Width(w).Height(h).Render(content)
 }
 
-func (m Model) renderPreview(w, h int) string {
+func (m Model) previewContent(w, h int) string {
 	if h < 4 {
 		h = 4
 	}
 
 	if len(m.filtered) == 0 || m.cursor >= len(m.filtered) {
 		empty := lipgloss.NewStyle().
-			Foreground(colorMuted).
-			Padding(2, 2).
+			Foreground(m.theme.colorMuted).
+			Padding(1, 1).
 			Render("No session selected")
-		return panelStyle.Width(w).Height(h - 2).Render(empty)
+		return m.theme.panelStyle.Width(w).Height(h).Render(empty)
 	}
 
 	s := m.filtered[m.cursor]
-	innerW := w - 4
+	innerW := max(1, w-4)
 	var lines []string
 
-	// Header: session UUID + which agent it belongs to. The shared header style
-	// carries a bottom margin, which would push the badge onto its own line, so
-	// the blank separator is appended explicitly instead.
-	lines = append(lines,
-		previewHeaderStyle.MarginBottom(0).Render(s.SessionID)+" "+providerBadge(s.Provider),
-		"")
-
-	// Metadata section
-	addField := func(label, value string) {
-		if value != "" {
-			lines = append(lines, previewLabelStyle.Render(label)+previewValueStyle.Render(value))
-		}
+	lines = append(lines, m.providerBadge(s.Provider)+"  "+m.theme.statusDescStyle.Render(clipLine(s.ProjectPath, innerW-11)))
+	title := terminalText(s.DisplayTitle())
+	if m.width < 90 {
+		title = clipLine(title, innerW)
+	} else {
+		lines = append(lines, "")
 	}
-
-	addField("Project:  ", s.ProjectPath)
-	if s.GitBranch != "" {
-		addField("Branch:   ", s.GitBranch)
+	lines = append(lines, m.theme.previewHeaderStyle.Width(innerW).Render(title))
+	var stats []string
+	if count := s.EstimatedMessages(); count > 0 || s.Enriched {
+		label := strconv.Itoa(count) + " messages"
+		if s.MessageCount == 0 && !s.Enriched {
+			label = "~" + label
+		}
+		stats = append(stats, label)
+	}
+	if s.TotalTokens() > 0 {
+		stats = append(stats, util.FormatTokens(s.TotalTokens())+"t")
+	}
+	if s.Model != "" {
+		stats = append(stats, s.Model)
+	}
+	lines = append(lines, m.theme.statusDescStyle.Render(clipLine(strings.Join(stats, "  ·  "), innerW)))
+	lines = append(lines, m.theme.previewValueStyle.Render(m.fileSummary(s.Provider)))
+	context := s.GitBranch
+	if context != "" {
+		context += "  ·  "
+	}
+	context += s.Modified.Format("02 Jan 15:04") + "  ·  " + displayID(s)
+	if m.width >= 90 {
+		lines = append(lines, m.theme.statusDescStyle.Render(clipLine(context, innerW)))
 	}
 	if s.IsSubagent {
 		label := s.AgentLabel
@@ -241,156 +239,86 @@ func (m Model) renderPreview(w, h int) string {
 			label = "subagent"
 		}
 		if s.Provider == provider.Claude {
-			label += "  (not resumable)"
+			label += " (not resumable)"
 		}
-		addField("Agent:    ", label)
+		lines = append(lines, m.theme.filterActiveStyle.Render(terminalText(label)))
 	}
 	if s.Archived {
-		addField("State:    ", "archived")
+		lines = append(lines, m.theme.filterActiveStyle.Render("Archived session"))
 	}
-
-	// Time row: created → modified (duration)
-	timeStr := s.Created.Format("2006-01-02 15:04")
-	dur := s.Duration()
-	if dur > 0 {
-		timeStr += "  →  " + s.Modified.Format("15:04") + "  (" + util.FormatDuration(dur) + ")"
+	if m.width >= 90 {
+		lines = append(lines, "")
 	}
-	addField("Time:     ", timeStr)
-
-	// Stats row: messages | size | model
-	var stats []string
-	msgs := s.EstimatedMessages()
-	if msgs > 0 {
-		msgLabel := strconv.Itoa(msgs) + " messages"
-		if s.MessageCount == 0 {
-			msgLabel = "~" + msgLabel
-		}
-		stats = append(stats, msgLabel)
-	}
-	stats = append(stats, util.FormatSize(s.FileSize))
-	if s.Model != "" {
-		stats = append(stats, s.Model)
-	}
-	addField("Stats:    ", strings.Join(stats, "  │  "))
-
-	// Token stats (from enrichment)
-	enrich := m.previewEnrichment
-	if enrich == nil && s.Enriched {
-		// Use cached enrichment from session entry
-		enrich = &session.EnrichmentData{
-			TotalInputTokens:  s.TotalInputTokens,
-			TotalOutputTokens: s.TotalOutputTokens,
-			CacheReadTokens:   s.CacheReadTokens,
-			CacheWriteTokens:  s.CacheWriteTokens,
-			Model:             s.Model,
-			ToolsUsed:         s.ToolsUsed,
-			FilesModified:     s.FilesModified,
-		}
-	}
-
-	if enrich != nil && (enrich.TotalInputTokens > 0 || enrich.TotalOutputTokens > 0) {
-		tokenStr := "in: " + util.FormatTokens(enrich.TotalInputTokens) +
-			"  out: " + util.FormatTokens(enrich.TotalOutputTokens)
-		if enrich.CacheReadTokens > 0 {
-			tokenStr += "  cached: " + util.FormatTokens(enrich.CacheReadTokens)
-		}
-		addField("Tokens:   ", tokenStr)
-	}
-
-	// Tools used
-	if enrich != nil && len(enrich.ToolsUsed) > 0 {
-		toolStr := strings.Join(enrich.ToolsUsed, ", ")
-		addField("Tools:    ", util.Truncate(toolStr, innerW-12))
-	}
-
-	// Files modified
-	if enrich != nil && len(enrich.FilesModified) > 0 {
-		fileCount := strconv.Itoa(len(enrich.FilesModified)) + " files"
-		// Show first few filenames
-		var fileNames []string
-		for i, f := range enrich.FilesModified {
-			if i >= 5 {
-				fileNames = append(fileNames, "+"+strconv.Itoa(len(enrich.FilesModified)-5)+" more")
-				break
-			}
-			fileNames = append(fileNames, filepath.Base(f))
-		}
-		addField("Files:    ", fileCount+" — "+strings.Join(fileNames, ", "))
-	}
-
+	fileHint := m.theme.statusKeyStyle.Render("[o]") + m.theme.statusDescStyle.Render(" Open files")
+	lines = append(lines, m.theme.itemTitleStyle.Render("Conversation")+strings.Repeat(" ", max(1, innerW-12-lipgloss.Width(fileHint)))+fileHint, m.theme.previewDividerStyle.Render(strings.Repeat("─", innerW)))
 	// Deep search snippets
 	if m.deepResults != nil {
-		if snippets, ok := m.deepResults[s.SessionID]; ok && len(snippets) > 0 {
+		if snippets, ok := m.deepResults[s.ReferenceID()]; ok && len(snippets) > 0 {
 			lines = append(lines, "")
-			lines = append(lines, previewDividerStyle.Render(strings.Repeat("─", innerW)))
-			lines = append(lines, filterActiveStyle.Render(" Matches:"))
+			lines = append(lines, m.theme.previewDividerStyle.Render(strings.Repeat("─", innerW)))
+			lines = append(lines, m.theme.filterActiveStyle.Render(" Matches:"))
 			for i, snip := range snippets {
 				if i >= 5 {
 					remaining := strconv.Itoa(len(snippets) - 5)
-					lines = append(lines, statusDescStyle.Render("  ... +"+remaining+" more"))
+					lines = append(lines, m.theme.statusDescStyle.Render("  ... +"+remaining+" more"))
 					break
 				}
-				lines = append(lines, previewMsgText.Render("  "+util.Truncate(snip, innerW-4)))
+				lines = append(lines, m.theme.previewMsgText.Render("  "+clipLine(snip, innerW-4)))
 			}
 		}
-	}
-
-	// Summary
-	if s.Summary != "" {
-		lines = append(lines, "")
-		lines = append(lines, previewDividerStyle.Render(strings.Repeat("─", innerW)))
-		lines = append(lines, previewLabelStyle.Render(" Summary"))
-		lines = append(lines, previewValueStyle.Render(" "+s.Summary))
 	}
 
 	// Conversation preview
-	if len(m.previewMsgs) > 0 && m.previewSessID == s.SessionID {
+	if len(m.previewMsgs) > 0 && m.previewSessID == s.ReferenceID() {
+
+		lines = append(lines, m.previewText, "")
+	}
+	if m.previewErr != nil {
+		lines = append(lines, "", "Preview unavailable: "+terminalText(m.previewErr.Error()))
+	} else if m.previewLoading {
 		lines = append(lines, "")
-		lines = append(lines, previewDividerStyle.Render(strings.Repeat("─", innerW)))
-		lines = append(lines, previewLabelStyle.Render(" Conversation"))
-
-		maxMsgs := (h - len(lines) - 4) // fill remaining space
-		if maxMsgs > 15 {
-			maxMsgs = 15
-		}
-		if maxMsgs < 3 {
-			maxMsgs = 3
-		}
-
-		shown := 0
-		for _, msg := range m.previewMsgs {
-			if shown >= maxMsgs {
-				break
-			}
-			text := util.Truncate(util.CleanPrompt(msg.Text), innerW-14)
-			if text == "" {
-				continue
-			}
-
-			roleStyle, tag := previewRoleAssistant, "[ast]"
-			if msg.Role == "user" {
-				roleStyle, tag = previewRoleUser, "[usr]"
-			}
-
-			prefix := roleStyle.Render(tag + " " + msg.Timestamp.Format("15:04") + " ")
-			lines = append(lines, prefix+previewMsgText.Render(text))
-			shown++
-		}
-	} else if m.previewSessID != s.SessionID {
-		lines = append(lines, "")
-		lines = append(lines, statusDescStyle.Render(" Loading..."))
+		lines = append(lines, m.theme.statusDescStyle.Render(" Loading..."))
 	}
 
-	content := strings.Join(lines, "\n")
-	return panelStyle.Width(w).Height(h - 2).Render(content)
+	lines = append(lines, "", m.theme.itemTitleStyle.Render("Session details"), m.theme.previewDividerStyle.Render(strings.Repeat("─", innerW)))
+	details := []string{"Reference: " + s.ReferenceID(), "Project: " + s.ProjectPath, "Created: " + s.Created.Format("2006-01-02 15:04"), "Transcript: " + util.FormatSize(s.FileSize)}
+	if s.GitBranch != "" {
+		details = append(details, "Branch: "+s.GitBranch)
+	}
+	if duration := s.Duration(); duration > 0 {
+		details = append(details, "Duration: "+util.FormatDuration(duration))
+	}
+	if s.TotalTokens() > 0 {
+		details = append(details, "Tokens: in "+util.FormatTokens(s.TotalInputTokens)+" / out "+util.FormatTokens(s.TotalOutputTokens)+" / cache read "+util.FormatTokens(s.CacheReadTokens)+" / cache write "+util.FormatTokens(s.CacheWriteTokens))
+	}
+	if len(s.ToolsUsed) > 0 {
+		details = append(details, "Tools: "+strings.Join(s.ToolsUsed, ", "))
+	}
+	for _, detail := range details {
+		lines = append(lines, m.theme.statusDescStyle.Render(terminalText(detail)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderPreview(w, h int) string {
+	style := m.theme.panelStyle
+	if m.previewFocused {
+		style = m.theme.activePanelStyle
+	}
+	hintText := "Tab focus · Enter read"
+	if m.previewFocused {
+		hintText = "Preview focused · ↑↓ scroll · g/G first/last"
+	}
+	hint := m.theme.statusDescStyle.Render(clipLine(hintText, w-4))
+	return style.Width(w).Height(h).MaxHeight(h).Render(m.preview.View() + "\n" + hint)
 }
 
 // providerBadge renders the agent tag shown beside a session.
-func providerBadge(k provider.Kind) string {
+func (m Model) providerBadge(k provider.Kind) string {
 	if k == provider.Codex {
-		return badgeCodexStyle.Render(" " + k.Badge() + " ")
+		return m.theme.badgeCodexStyle.Render(" Codex  ")
 	}
-	return badgeClaudeStyle.Render(" " + k.Badge() + " ")
+	return m.theme.badgeClaudeStyle.Render(" Claude ")
 }
 
 // shortPath makes a path displayable: ~/proj or ~/Documents/proj
@@ -416,18 +344,59 @@ func shortPath(p string, maxW int) string {
 }
 
 func (m Model) renderStatusBar() string {
-	parts := []string{
-		statusKeyStyle.Render("↑↓") + statusDescStyle.Render(" nav"),
-		statusKeyStyle.Render("/") + statusDescStyle.Render(" search"),
-		statusKeyStyle.Render("tab") + statusDescStyle.Render(" deep"),
-		statusKeyStyle.Render("s") + statusDescStyle.Render(" sort"),
-		statusKeyStyle.Render("p") + statusDescStyle.Render(" project"),
-		statusKeyStyle.Render("d") + statusDescStyle.Render(" date"),
-		statusKeyStyle.Render("f") + statusDescStyle.Render(" agent"),
-		statusKeyStyle.Render("a") + statusDescStyle.Render(" subagents"),
-		statusKeyStyle.Render("⏎") + statusDescStyle.Render(" resume"),
-		statusKeyStyle.Render("y") + statusDescStyle.Render(" copy"),
-		statusKeyStyle.Render("q") + statusDescStyle.Render(" quit"),
+	h := help.New()
+	h.SetWidth(m.width - 2)
+	h.ShortSeparator = "   "
+	h.Styles.ShortKey = m.theme.statusKeyStyle
+	h.Styles.ShortDesc = m.theme.statusDescStyle
+	bindings := []key.Binding{keys.Help, keys.Enter, keys.Search, keys.Tab, keys.Files, keys.Quit}
+	if m.searchActive {
+		accept, back := keys.Enter, keys.Escape
+		accept.SetHelp("enter", "read")
+		back.SetHelp("esc", "back")
+		bindings = []key.Binding{keys.Help, keys.Scope, accept, back}
 	}
-	return statusBarStyle.Width(m.width - 2).Render(strings.Join(parts, "  "))
+	return m.theme.statusBarStyle.Render(ansi.Truncate(h.ShortHelpView(bindings), max(1, m.width-2), "…"))
+}
+
+func displayID(s session.SessionEntry) string {
+	ref := s.ReferenceID()
+	if i := strings.LastIndexByte(ref, '/'); i >= 0 {
+		ref = ref[i+1:]
+	}
+	if len(ref) > 12 {
+		return ref[:12]
+	}
+	return ref
+}
+
+func (m Model) fileSummary(kind provider.Kind) string {
+	if m.previewLoading {
+		return "Recorded files: loading…"
+	}
+	if m.previewFilesErr != nil {
+		return "Recorded files: unavailable"
+	}
+	saved, added, updated, deleted := 0, 0, 0, 0
+	for _, f := range m.previewFiles {
+		if f.Recoverable {
+			saved++
+		}
+		switch f.Kind {
+		case session.ChangeAdd:
+			added++
+		case session.ChangeUpdate:
+			updated++
+		case session.ChangeDelete:
+			deleted++
+		}
+	}
+	summary := fmt.Sprintf("Recorded files: %d · %d with saved content", len(m.previewFiles), saved)
+	if len(m.previewFiles) > 0 {
+		summary += fmt.Sprintf("\n%d added · %d updated · %d deleted", added, updated, deleted)
+		if kind == provider.Claude {
+			summary += " (inferred)"
+		}
+	}
+	return summary
 }

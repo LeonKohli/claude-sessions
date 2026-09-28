@@ -2,16 +2,21 @@ package tui
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
-	"path/filepath"
+	"os/exec"
 	"sort"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/textinput"
+	"charm.land/bubbles/v2/viewport"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/LeonKohli/claude-sessions/internal/provider"
 	"github.com/LeonKohli/claude-sessions/internal/session"
@@ -110,6 +115,15 @@ func (s sortMode) String() string {
 }
 
 type Model struct {
+	requestID        uint64
+	previewRequest   uint64
+	previewRenderID  uint64
+	previewText      string
+	previewRendering bool
+	readerRendering  bool
+
+	theme theme
+	dark  bool
 	// Data
 	allSessions  []session.SessionEntry
 	filtered     []session.SessionEntry
@@ -129,17 +143,24 @@ type Model struct {
 	// Filters
 	projectFilter  string // empty = all
 	projects       []string
-	projectIdx     int
 	dateFilter     dateFilter
 	providerFilter providerFilter
 	showSubagents  bool
 	sortBy         sortMode
 
 	// Preview
-	previewMsgs       []session.PreviewMessage
-	previewSessID     string
-	previewEnrichment *session.EnrichmentData
-	previewScroll     int
+	previewMsgs     []session.PreviewMessage
+	previewSessID   string
+	preview         viewport.Model
+	previewLoading  bool
+	previewErr      error
+	previewFiles    []session.FileChange
+	previewFilesErr error
+
+	reader         *conversationReader
+	previewFocused bool
+	files          *fileBrowser
+	menu           *actionMenu
 
 	// UI state
 	width  int
@@ -157,6 +178,8 @@ func NewModel(sessions []session.SessionEntry) Model {
 	ti := textinput.New()
 	ti.Placeholder = "Search sessions..."
 	ti.CharLimit = 200
+	ti.Prompt = ""
+	ti.SetVirtualCursor(true)
 
 	// Extract unique projects
 	projSet := make(map[string]bool)
@@ -174,49 +197,175 @@ func NewModel(sessions []session.SessionEntry) Model {
 	// Build lookup map
 	smap := make(map[string]*session.SessionEntry, len(sessions))
 	for i := range sessions {
-		smap[sessions[i].SessionID] = &sessions[i]
+		smap[sessions[i].ReferenceID()] = &sessions[i]
 	}
 
 	m := Model{
+		theme: newTheme(true), dark: true,
+		preview:     viewport.New(),
 		allSessions: sessions,
 		sessionMap:  smap,
 		searchInput: ti,
 		projects:    projects,
 	}
 	m.applyFilters()
+	m.preview.SoftWrap = true
+	m.preview.FillHeight = true
 	return m
 }
 
 func (m Model) Init() tea.Cmd {
-	// Load preview for first item on startup
-	return m.triggerPreview()
+	return tea.RequestBackgroundColor
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.BackgroundColorMsg:
+		m.dark = msg.IsDark()
+		m.theme = newTheme(m.dark)
+		m.styleMenu()
+		m.refreshPreview()
+		previewCmd := m.stylePreview()
+		var readerCmd tea.Cmd
+		m.searchInput.SetStyles(textinput.DefaultStyles(m.dark))
+		if m.files != nil {
+			m.setFileContent()
+		}
+		if m.reader != nil {
+			m.reader.find.SetStyles(textinput.DefaultStyles(m.dark))
+			readerCmd = m.styleReader()
+		}
+		return m, tea.Batch(previewCmd, readerCmd)
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.sizeMenu()
+		m.searchInput.SetWidth(m.searchFieldWidth())
+		m.ensureCursorVisible()
+		m.sizeFileViewport()
+		m.refreshPreview()
+		previewCmd := m.stylePreview()
+		var readerCmd tea.Cmd
+		if m.reader != nil {
+			m.reader.viewport.SetWidth(max(1, m.width-4))
+			m.reader.viewport.SetHeight(max(1, m.height-6))
+			m.reader.find.SetWidth(max(1, m.width-24))
+			readerCmd = m.styleReader()
+		}
 		if !m.ready {
 			m.ready = true
 			// Trigger initial preview now that we have dimensions
 			return m, m.triggerPreview()
 		}
-		return m, nil
+		return m, tea.Batch(previewCmd, readerCmd)
 
-	case tea.KeyMsg:
+	case tea.PasteMsg:
+		if m.menu != nil {
+			return m.handleMenu(msg)
+		}
+		if m.files != nil {
+			return m, nil
+		}
+		if m.reader != nil {
+			if !m.reader.finding {
+				return m, nil
+			}
+			var cmd tea.Cmd
+			m.reader.find, cmd = m.reader.find.Update(msg)
+			m.reader.search()
+			return m, cmd
+		}
+		if m.searchActive {
+			return m.updateSearchInput(msg)
+		}
+		return m, nil
+	case tea.KeyPressMsg:
+		if msg.String() == "ctrl+c" {
+			m.stopDeepSearch()
+			return m, tea.Quit
+		}
+		if m.menu != nil {
+			return m.handleMenu(msg)
+		}
+		if msg.String() == "ctrl+k" || msg.String() == "f1" || (msg.String() == "?" && !m.editingText()) {
+			return m, m.openActions()
+		}
+		if m.files != nil {
+			return m.handleFileKey(msg)
+		}
+		if m.reader != nil {
+			return m.handleReaderKey(msg)
+		}
 		if m.searchActive {
 			return m.handleSearchKey(msg)
 		}
 		return m.handleNormalKey(msg)
 
+	case readerLoaded:
+		if m.reader != nil && m.reader.request == msg.request {
+			m.reader.loading = false
+			m.reader.messages = msg.messages
+			m.reader.notice = msg.notice
+			if msg.err != nil {
+				m.reader.notice += "\nConversation unavailable: " + terminalText(msg.err.Error())
+			}
+			cmd := m.styleReader()
+			return m, cmd
+		}
+		return m, nil
+	case readerRendered:
+		m.readerRendering = false
+		if m.reader != nil && m.reader.request == msg.request && m.reader.renderID == msg.renderID {
+			if !msg.raw {
+				m.reader.markdown = &msg
+			}
+			m.setReaderViewport(msg.viewport)
+		} else if m.reader != nil && m.reader.loading {
+			cmd := m.styleReader()
+			return m, cmd
+		}
+		return m, nil
+	case previewRendered:
+		m.previewRendering = false
+		if m.previewRequest == msg.request && m.previewRenderID == msg.renderID {
+			m.previewText = msg.text
+			m.refreshPreview()
+		} else {
+			cmd := m.stylePreview()
+			return m, cmd
+		}
+		return m, nil
+	case filesLoaded:
+		if m.files != nil && msg.request == m.files.request {
+			m.files.files = msg.files
+			m.files.err = msg.err
+			m.files.loading = false
+			if msg.err == nil {
+				return m, m.files.load()
+			}
+		}
+		return m, nil
+	case fileLoaded:
+		if m.files != nil && msg.request == m.files.request && msg.loadID == m.files.loadID && len(m.files.files) > 0 && msg.path == m.files.files[m.files.cursor].Path {
+			m.files.text = msg.text
+			m.setFileContent()
+			m.files.err = msg.err
+			m.files.loading = false
+		}
+		return m, nil
 	case PreviewLoadedMsg:
-		if msg.SessionID == m.previewSessID {
+		if msg.Request != m.previewRequest {
+			return m, nil
+		}
+		if msg.ReferenceID == m.previewSessID {
+			m.previewLoading = false
+			m.previewErr = msg.Err
 			m.previewMsgs = msg.Messages
-			m.previewEnrichment = msg.Enrichment
+			m.previewFiles = msg.Files
+			m.previewFilesErr = msg.FilesErr
 			// Also update the session entry with enrichment data
 			if msg.Enrichment != nil {
-				if entry, ok := m.sessionMap[msg.SessionID]; ok {
+				if entry, ok := m.sessionMap[msg.ReferenceID]; ok {
 					entry.TotalInputTokens = msg.Enrichment.TotalInputTokens
 					entry.TotalOutputTokens = msg.Enrichment.TotalOutputTokens
 					entry.CacheReadTokens = msg.Enrichment.CacheReadTokens
@@ -225,26 +374,40 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					entry.ToolsUsed = msg.Enrichment.ToolsUsed
 					entry.FilesModified = msg.Enrichment.FilesModified
 					entry.Enriched = true
-					if msg.Enrichment.MessageCount > 0 {
-						entry.MessageCount = msg.Enrichment.MessageCount
+					entry.MessageCount = msg.Enrichment.MessageCount
+					for i := range m.filtered {
+						if m.filtered[i].FullPath == entry.FullPath {
+							m.filtered[i] = *entry
+						}
 					}
 				}
 			}
 		}
-		return m, nil
+		m.refreshPreview()
+		cmd := m.stylePreview()
+		return m, cmd
 
 	case DeepSearchResultMsg:
+		if msg.ID != m.debounceID || msg.Query != m.searchInput.Value() || m.searchMode != searchDeep || msg.Query == "" {
+			return m, nil
+		}
 		m.deepSearching = false
+		if m.deepCancel != nil {
+			m.deepCancel()
+			m.deepCancel = nil
+		}
+		m.toast = ""
 		if msg.Err != nil {
 			m.toast = msg.Err.Error()
-			return m, nil
 		}
 		m.deepResults = make(map[string][]string)
 		for _, r := range msg.Results {
-			m.deepResults[r.Session.SessionID] = r.Snippets
+			m.deepResults[r.Session.ReferenceID()] = r.Snippets
 		}
 		m.applyFilters()
-		return m, nil
+		m.cursor = 0
+		m.scrollOffset = 0
+		return m, m.triggerPreview()
 
 	case ToastMsg:
 		m.toast = msg.Text
@@ -257,19 +420,70 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case SearchDebounceMsg:
-		if msg.ID == m.debounceID && m.searchMode == searchDeep {
+		if msg.ID == m.debounceID && m.searchMode == searchDeep && msg.Query == m.searchInput.Value() {
 			m.deepSearching = true
 			return m, m.runDeepSearch(msg.Query)
 		}
 		return m, nil
 	}
 
-	return m, nil
+	if m.menu != nil {
+		return m.handleMenu(msg)
+	}
+	var cmd tea.Cmd
+	if m.reader != nil && m.reader.finding {
+		m.reader.find, cmd = m.reader.find.Update(msg)
+	} else if m.searchActive {
+		m.searchInput, cmd = m.searchInput.Update(msg)
+	}
+	return m, cmd
 }
 
-func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m Model) handleNormalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if msg.String() == "tab" || msg.String() == "shift+tab" {
+		m.searchActive = false
+		m.searchInput.Blur()
+		m.previewFocused = !m.previewFocused
+		return m, nil
+	}
+	if m.previewFocused {
+		switch msg.String() {
+		case "g", "home":
+			m.preview.GotoTop()
+			return m, nil
+		case "G", "end":
+			m.preview.GotoBottom()
+			return m, nil
+		case "up", "k":
+			m.scrollPreview(-1)
+			return m, nil
+		case "down", "j":
+			m.scrollPreview(1)
+			return m, nil
+		case "pgup", "ctrl+u":
+			m.scrollPreview(-max(1, m.height/2))
+			return m, nil
+		case "pgdown", "ctrl+d":
+			m.scrollPreview(max(1, m.height/2))
+			return m, nil
+		case "esc":
+			m.previewFocused = false
+			return m, nil
+		}
+	}
 	switch {
+	case key.Matches(msg, keys.Enter):
+		return m, m.openReader()
+	case msg.String() == "o":
+		return m, m.openFiles()
+	case msg.String() == "]":
+		m.scrollPreview(max(1, m.height/2))
+		return m, nil
+	case msg.String() == "[":
+		m.scrollPreview(-max(1, m.height/2))
+		return m, nil
 	case key.Matches(msg, keys.Quit):
+		m.stopDeepSearch()
 		return m, tea.Quit
 
 	case key.Matches(msg, keys.Up):
@@ -291,7 +505,7 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case key.Matches(msg, keys.HalfUp):
-		listH := m.listHeight()
+		listH := max(1, m.listHeight()/m.listItemHeight())
 		m.cursor -= listH / 2
 		if m.cursor < 0 {
 			m.cursor = 0
@@ -300,7 +514,7 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.triggerPreview()
 
 	case key.Matches(msg, keys.HalfDown):
-		listH := m.listHeight()
+		listH := max(1, m.listHeight()/m.listItemHeight())
 		m.cursor += listH / 2
 		if m.cursor >= len(m.filtered) {
 			m.cursor = len(m.filtered) - 1
@@ -325,7 +539,7 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.triggerPreview()
 
 	case key.Matches(msg, keys.PageUp):
-		listH := m.listHeight()
+		listH := max(1, m.listHeight()/m.listItemHeight())
 		m.cursor -= listH
 		if m.cursor < 0 {
 			m.cursor = 0
@@ -334,7 +548,7 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.triggerPreview()
 
 	case key.Matches(msg, keys.PageDown):
-		listH := m.listHeight()
+		listH := max(1, m.listHeight()/m.listItemHeight())
 		m.cursor += listH
 		if m.cursor >= len(m.filtered) {
 			m.cursor = len(m.filtered) - 1
@@ -345,7 +559,7 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.ensureCursorVisible()
 		return m, m.triggerPreview()
 
-	case key.Matches(msg, keys.Enter):
+	case msg.String() == "r":
 		if len(m.filtered) > 0 && m.cursor < len(m.filtered) {
 			s := m.filtered[m.cursor]
 			// Claude writes subagent transcripts under an agent-<uuid> name
@@ -367,66 +581,29 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.searchInput.Focus()
 		return m, textinput.Blink
 
-	case key.Matches(msg, keys.Tab):
-		if m.searchMode == searchFuzzy {
-			m.searchMode = searchDeep
-		} else {
-			m.searchMode = searchFuzzy
-		}
-		if m.searchInput.Value() != "" {
-			m.applyFilters()
-		}
-		return m, nil
+	case msg.String() == "ctrl+s":
+		cmd := m.toggleSearchMode()
+		return m, cmd
 
 	case key.Matches(msg, keys.CopyUUID):
 		if len(m.filtered) > 0 && m.cursor < len(m.filtered) {
-			s := m.filtered[m.cursor]
-			if err := util.CopyToClipboard(s.SessionID); err == nil {
-				return m, func() tea.Msg {
-					return ToastMsg{Text: "UUID copied!"}
-				}
-			} else {
-				return m, func() tea.Msg {
+			id := m.filtered[m.cursor].ReferenceID()
+			return m, func() tea.Msg {
+				if err := util.CopyToClipboard(id); err != nil {
 					return ToastMsg{Text: err.Error()}
 				}
+				return ToastMsg{Text: "Session ID copied"}
 			}
 		}
 
 	case key.Matches(msg, keys.Project):
-		m.projectIdx++
-		if m.projectIdx > len(m.projects) {
-			m.projectIdx = 0
-		}
-		if m.projectIdx == 0 {
-			m.projectFilter = ""
-		} else {
-			m.projectFilter = m.projects[m.projectIdx-1]
-		}
-		m.cursor = 0
-		m.scrollOffset = 0
-		m.applyFilters()
-		return m, m.triggerPreview()
-
+		return m, m.openProjectMenu()
 	case key.Matches(msg, keys.Sort):
-		m.sortBy = (m.sortBy + 1) % sortModeCount
-		m.cursor = 0
-		m.scrollOffset = 0
-		m.applyFilters()
-		return m, m.triggerPreview()
-
+		return m, m.openSortMenu()
 	case key.Matches(msg, keys.DateFilter):
-		m.dateFilter = (m.dateFilter + 1) % 4
-		m.cursor = 0
-		m.scrollOffset = 0
-		m.applyFilters()
-		return m, m.triggerPreview()
-
+		return m, m.openDateMenu()
 	case key.Matches(msg, keys.Provider):
-		m.providerFilter = (m.providerFilter + 1) % providerFilterCount
-		m.cursor = 0
-		m.scrollOffset = 0
-		m.applyFilters()
-		return m, m.triggerPreview()
+		return m, m.openProviderMenu()
 
 	case key.Matches(msg, keys.Subagents):
 		m.showSubagents = !m.showSubagents
@@ -437,6 +614,7 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, keys.Escape):
 		if m.searchInput.Value() != "" {
+			m.stopDeepSearch()
 			m.searchInput.SetValue("")
 			m.deepResults = nil
 			m.cursor = 0
@@ -451,57 +629,69 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.Type {
-	case tea.KeyEsc:
+func (m Model) handleSearchKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "up", "down", "ctrl+n", "ctrl+p":
+		if msg.String() == "ctrl+n" {
+			msg = tea.KeyPressMsg{Code: tea.KeyDown}
+		}
+		if msg.String() == "ctrl+p" {
+			msg = tea.KeyPressMsg{Code: tea.KeyUp}
+		}
+		m.previewFocused = false
+		return m.handleNormalKey(msg)
+	case "esc":
 		m.searchActive = false
 		m.searchInput.Blur()
 		return m, nil
 
-	case tea.KeyEnter:
+	case "enter":
 		m.searchActive = false
 		m.searchInput.Blur()
+		return m, m.openReader()
+	case "tab":
+		m.searchActive = false
+		m.searchInput.Blur()
+		m.previewFocused = true
+		return m, nil
+	case "ctrl+s":
+		cmd := m.toggleSearchMode()
+		return m, cmd
+
+	default:
+		return m.updateSearchInput(msg)
+	}
+}
+
+func (m Model) updateSearchInput(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+	oldQuery := m.searchInput.Value()
+	m.searchInput, cmd = m.searchInput.Update(msg)
+	if oldQuery == m.searchInput.Value() {
+		return m, cmd
+	}
+	m.stopDeepSearch()
+	m.deepResults = nil
+
+	if m.searchMode == searchFuzzy || m.searchInput.Value() == "" {
 		m.cursor = 0
 		m.scrollOffset = 0
 		m.applyFilters()
-		if m.searchMode == searchDeep && m.searchInput.Value() != "" {
-			m.deepSearching = true
-			return m, m.runDeepSearch(m.searchInput.Value())
-		}
-		return m, m.triggerPreview()
-
-	case tea.KeyTab:
-		if m.searchMode == searchFuzzy {
-			m.searchMode = searchDeep
-		} else {
-			m.searchMode = searchFuzzy
-		}
-		return m, nil
-
-	default:
-		var cmd tea.Cmd
-		m.searchInput, cmd = m.searchInput.Update(msg)
-
-		if m.searchMode == searchFuzzy {
-			m.cursor = 0
-			m.scrollOffset = 0
-			m.applyFilters()
-			previewCmd := m.triggerPreview()
-			return m, tea.Batch(cmd, previewCmd)
-		}
-
-		if m.searchMode == searchDeep && m.searchInput.Value() != "" {
-			m.debounceID++
-			id := m.debounceID
-			query := m.searchInput.Value()
-			debouncCmd := tea.Tick(300*time.Millisecond, func(t time.Time) tea.Msg {
-				return SearchDebounceMsg{Query: query, ID: id}
-			})
-			return m, tea.Batch(cmd, debouncCmd)
-		}
-
-		return m, cmd
+		previewCmd := m.triggerPreview()
+		return m, tea.Batch(cmd, previewCmd)
 	}
+
+	if m.searchMode == searchDeep && m.searchInput.Value() != "" {
+		m.debounceID++
+		id := m.debounceID
+		query := m.searchInput.Value()
+		debouncCmd := tea.Tick(300*time.Millisecond, func(t time.Time) tea.Msg {
+			return SearchDebounceMsg{Query: query, ID: id}
+		})
+		return m, tea.Batch(cmd, debouncCmd)
+	}
+
+	return m, cmd
 }
 
 func (m *Model) applyFilters() {
@@ -526,7 +716,7 @@ func (m *Model) applyFilters() {
 		}
 
 		if m.searchMode == searchDeep && m.deepResults != nil {
-			if _, ok := m.deepResults[s.SessionID]; !ok {
+			if _, ok := m.deepResults[s.ReferenceID()]; !ok {
 				continue
 			}
 		}
@@ -611,7 +801,7 @@ func (m *Model) matchesDateFilter(s session.SessionEntry) bool {
 }
 
 func (m *Model) ensureCursorVisible() {
-	itemH := 3
+	itemH := m.listItemHeight()
 	visibleItems := m.listHeight() / itemH
 	if visibleItems < 1 {
 		visibleItems = 1
@@ -626,52 +816,94 @@ func (m *Model) ensureCursorVisible() {
 }
 
 func (m Model) listHeight() int {
-	return m.height - 6
+	h := m.height - lipgloss.Height(m.renderSearchBar()) - lipgloss.Height(m.renderStatusBar())
+	if m.width < 90 {
+		return 4
+	}
+	return max(0, h-3)
 }
 
 // triggerPreview sets previewSessID on the model and returns a cmd
 // to load the preview messages + enrichment asynchronously.
 func (m *Model) triggerPreview() tea.Cmd {
+	if len(m.filtered) > 0 && m.cursor < len(m.filtered) && m.filtered[m.cursor].ReferenceID() == m.previewSessID && m.previewMsgs != nil {
+		return nil
+	}
+	m.requestID++
+	m.previewRequest = m.requestID
+	request := m.previewRequest
+	m.previewRenderID++
+	m.previewText = ""
+	m.previewErr = nil
 	if len(m.filtered) == 0 || m.cursor >= len(m.filtered) {
+		m.previewLoading = false
 		m.previewSessID = ""
 		m.previewMsgs = nil
-		m.previewEnrichment = nil
+		m.refreshPreview()
 		return nil
 	}
 	s := m.filtered[m.cursor]
-	if s.SessionID == m.previewSessID && m.previewMsgs != nil {
-		return nil // already loaded
-	}
-	m.previewSessID = s.SessionID
+	m.preview.GotoTop()
+	m.previewSessID = s.ReferenceID()
+	m.previewLoading = true
+	m.previewFiles = nil
+	m.previewFilesErr = nil
 	m.previewMsgs = nil
-	m.previewEnrichment = nil
+	m.refreshPreview()
 	path := s.FullPath
-	sid := s.SessionID
+	sid := s.ReferenceID()
 	kind := s.Provider
 	enriched := s.Enriched
 	return func() tea.Msg {
-		msgs, _ := session.ReadPreview(kind, path, 30)
+		msgs, readErr := session.ReadPreview(kind, path, 30)
 		var enrichment *session.EnrichmentData
-		if !enriched {
-			enrichment, _ = session.Enrich(kind, path)
+		var enrichErr error
+		if !enriched && readErr == nil {
+			enrichment, enrichErr = session.Enrich(kind, path)
+			if enrichErr != nil {
+				enrichment = nil
+			}
 		}
-		return PreviewLoadedMsg{SessionID: sid, Messages: msgs, Enrichment: enrichment}
+		files, filesErr := session.FileChanges(s)
+		return PreviewLoadedMsg{Request: request, ReferenceID: sid, Messages: msgs, Enrichment: enrichment, Files: files, FilesErr: filesErr, Err: errors.Join(readErr, enrichErr)}
 	}
 }
 
-func (m Model) runDeepSearch(query string) tea.Cmd {
+func (m *Model) stopDeepSearch() {
+	m.debounceID++
+	if m.deepCancel != nil {
+		m.deepCancel()
+		m.deepCancel = nil
+	}
+	m.deepSearching = false
+}
+
+func (m *Model) toggleSearchMode() tea.Cmd {
+	m.stopDeepSearch()
+	m.searchMode = (m.searchMode + 1) % 2
+	m.deepResults = nil
+	m.cursor, m.scrollOffset = 0, 0
+	m.applyFilters()
+	if m.searchMode == searchDeep && m.searchInput.Value() != "" {
+		return m.runDeepSearch(m.searchInput.Value())
+	}
+	return m.triggerPreview()
+}
+
+func (m *Model) runDeepSearch(query string) tea.Cmd {
+	m.stopDeepSearch()
 	if query == "" {
 		return nil
 	}
 
-	if m.deepCancel != nil {
-		m.deepCancel()
-	}
-
-	sessions := m.allSessions
+	ctx, cancel := context.WithCancel(context.Background())
+	m.deepCancel = cancel
+	m.deepSearching = true
+	id := m.debounceID
+	sessions := append([]session.SessionEntry(nil), m.allSessions...)
 	return func() tea.Msg {
-		results, err := deepSearch(context.Background(), sessions, query)
-		return DeepSearchResultMsg{Query: query, Results: results, Err: err}
+		results, err := deepSearch(ctx, sessions, query)
+		return DeepSearchResultMsg{ID: id, Query: query, Results: results, Err: err}
 	}
 }
 
@@ -680,31 +912,46 @@ func (m Model) runDeepSearch(query string) tea.Cmd {
 // Both agents are launched from the session's own directory. Claude needs it to
 // locate the transcript at all; Codex would otherwise notice the mismatch and
 // interrupt the resume with an interactive working-directory prompt.
-func (m Model) ExecResume() {
+func (m Model) ExecResume() error {
 	if m.resumeSessionID == "" {
-		return
+		return nil
 	}
 
 	if m.resumeProject != "" {
-		os.Chdir(m.resumeProject)
+		if err := os.Chdir(m.resumeProject); err != nil {
+			return fmt.Errorf("resume in %q: %w", m.resumeProject, err)
+		}
 	}
 
 	bin, argv := m.resumeProvider.ResumeArgv(m.resumeSessionID)
-	binPath, err := lookPath(bin)
+	binPath, err := exec.LookPath(bin)
 	if err != nil {
-		os.Stderr.WriteString("Could not find " + bin + " on PATH\n")
-		os.Exit(1)
+		return fmt.Errorf("resume %s: %w", bin, err)
 	}
-
-	syscall.Exec(binPath, argv, os.Environ())
+	if err := syscall.Exec(binPath, argv, os.Environ()); err != nil {
+		return fmt.Errorf("resume %s: %w", bin, err)
+	}
+	return nil
 }
 
-func lookPath(bin string) (string, error) {
-	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
-		p := filepath.Join(dir, bin)
-		if info, err := os.Stat(p); err == nil && !info.IsDir() {
-			return p, nil
-		}
+func (m *Model) refreshPreview() {
+	_, w, _, h := m.panelDimensions()
+	m.preview.SetWidth(max(1, w-4))
+	m.preview.SetHeight(max(1, h-3))
+	m.preview.SetContent(ansi.Wordwrap(m.previewContent(w, h), max(1, w-4), ""))
+}
+
+func (m *Model) scrollPreview(delta int) {
+	if delta > 0 {
+		m.preview.ScrollDown(delta)
+	} else {
+		m.preview.ScrollUp(-delta)
 	}
-	return "", os.ErrNotExist
+}
+
+func (m Model) listItemHeight() int {
+	if m.searchMode == searchDeep && m.deepResults != nil {
+		return 3
+	}
+	return 2
 }

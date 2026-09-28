@@ -1,8 +1,11 @@
 package tui
 
-import "github.com/charmbracelet/bubbles/key"
+import "charm.land/bubbles/v2/key"
 
 type keyMap struct {
+	Scope      key.Binding
+	Resume     key.Binding
+	Files      key.Binding
 	Quit       key.Binding
 	Up         key.Binding
 	Down       key.Binding
@@ -26,6 +29,9 @@ type keyMap struct {
 }
 
 var keys = keyMap{
+	Scope:  key.NewBinding(key.WithKeys("ctrl+s"), key.WithHelp("ctrl+s", "search scope")),
+	Resume: key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "resume")),
+	Files:  key.NewBinding(key.WithKeys("o"), key.WithHelp("[o]", "Open files")),
 	Quit: key.NewBinding(
 		key.WithKeys("q", "ctrl+c"),
 		key.WithHelp("q", "quit"),
@@ -40,11 +46,11 @@ var keys = keyMap{
 	),
 	Enter: key.NewBinding(
 		key.WithKeys("enter"),
-		key.WithHelp("enter", "resume session"),
+		key.WithHelp("enter", "read"),
 	),
 	Tab: key.NewBinding(
 		key.WithKeys("tab"),
-		key.WithHelp("tab", "toggle search mode"),
+		key.WithHelp("tab", "focus"),
 	),
 	Search: key.NewBinding(
 		key.WithKeys("/"),
@@ -56,19 +62,19 @@ var keys = keyMap{
 	),
 	CopyUUID: key.NewBinding(
 		key.WithKeys("y"),
-		key.WithHelp("y", "copy UUID"),
+		key.WithHelp("y", "copy ID"),
 	),
 	Project: key.NewBinding(
 		key.WithKeys("p"),
-		key.WithHelp("p", "cycle project filter"),
+		key.WithHelp("p", "choose project"),
 	),
 	DateFilter: key.NewBinding(
 		key.WithKeys("d"),
-		key.WithHelp("d", "cycle date filter"),
+		key.WithHelp("d", "choose date range"),
 	),
 	Provider: key.NewBinding(
 		key.WithKeys("f"),
-		key.WithHelp("f", "cycle provider filter"),
+		key.WithHelp("f", "choose agent"),
 	),
 	Subagents: key.NewBinding(
 		key.WithKeys("a"),
@@ -76,11 +82,11 @@ var keys = keyMap{
 	),
 	Sort: key.NewBinding(
 		key.WithKeys("s"),
-		key.WithHelp("s", "cycle sort"),
+		key.WithHelp("s", "choose sort"),
 	),
 	Help: key.NewBinding(
-		key.WithKeys("?"),
-		key.WithHelp("?", "help"),
+		key.WithKeys("?", "ctrl+k", "f1"),
+		key.WithHelp("ctrl+k", "Actions"),
 	),
 	PageUp: key.NewBinding(
 		key.WithKeys("pgup"),
