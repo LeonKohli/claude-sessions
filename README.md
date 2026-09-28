@@ -4,7 +4,7 @@ Search, read, and recover files from **Claude Code** and **Codex** session histo
 
 Both agents leave multi-GB piles of JSONL you can only get back into through their own cwd-scoped pickers. This indexes all of it and exposes it two ways: an interactive browser for you, and a structured, bounded CLI for the agent sitting next to you.
 
-![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go) ![Bubbletea](https://img.shields.io/badge/Bubbletea-TUI-FF75B5)
+![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go) ![Bubbletea](https://img.shields.io/badge/Bubbletea-TUI-FF75B5)
 
 ## Two surfaces
 
@@ -20,24 +20,29 @@ Running it bare on a TTY opens the browser. Piped, or with any subcommand, it ne
 | Command | Purpose |
 |---|---|
 | `search <query>` | Sessions matching a query, ranked by match count, with snippets |
-| `show <id>` | The conversation |
+| `show <id> [query]` | Conversation turns, optionally filtered by a literal substring |
+| `calls <id> [query]` | Recorded tool inputs, optionally filtered by a literal substring |
 | `files <id>` | What the session changed on disk, and whether content is recoverable |
 | `cat <id> <path>` | Recovered file content, raw bytes, no envelope |
 | `diff <id> <path>` | Unified diffs Codex recorded for a file |
 | `resume <id>` | The command that reopens it, plus `cwd_exists` (prints, never execs) |
 | `list` | Recent sessions |
-| `schema` | Commands, flags, and error codes as JSON |
+| `schema` | Commands, response field paths, limits, flags, and error codes as JSON |
 
 Flags: `--output auto\|json\|text`, `--agent claude\|codex`, `--project`, `--since 72h`, `--limit`, `--snippets`, `--max-chars`, `--subagents`.
 
-Every response is an envelope, and truncation is always declared:
+Operands also accept names: `--id`, `--query`, and `--path`, where the command takes that operand. Their order does not matter: `show --query error --id <id>` filters the selected conversation. A single `--claude` or `--codex` overrides `--agent`; using both selects both providers in the CLI and browser.
+
+JSON responses use an envelope, except successful `cat`, which returns raw bytes. The `truncated` field reports omitted records:
 
 ```json
 {"ok":true,"schema":1,"cmd":"search","data":{"query":"error","hits":[…],"count":5},
  "truncated":{"returned":5,"total":848,"has_more":true,"hint":"raise --limit to see more (total 848)"}}
 ```
 
-`total` appears only when the command actually counted the full set. `show` reads lazily and reports `has_more` with no `total` — inventing one from the window it happened to read would tell a caller it had the whole conversation after one more request.
+`total` appears only when the command counted the full set. `show` reports `has_more` without a `total`. Modern Codex and Claude previews stop after the requested window; legacy Codex rollouts are scanned fully to distinguish legacy events from duplicated response messages.
+
+Text can also be shortened. `show` marks `text_truncated`, and `calls` marks `input_truncated`. Search snippets are always previews. See [storage and evidence limits](docs/storage-contract.md) before interpreting missing results, generated context, or file recovery as complete history.
 
 Failures go to **stderr** with a stable code and a non-zero exit, so a consumer piping stdout never has to disentangle them from data:
 
@@ -49,6 +54,35 @@ Failures go to **stderr** with a stable code and a non-zero exit, so a consumer 
 ```
 
 Codes: `usage_error`, `not_found`, `ambiguous_id`, `store_unavailable`, `not_recoverable`, `internal_error`.
+
+`search` finds sessions by conversation text. `show` returns turns in transcript order. Add a case-insensitive literal query to filter complete turns before applying limits:
+
+Use the returned `id` unchanged. Codex archive IDs use `<thread-id>/<rollout-id>` to distinguish physical histories, including the original rollout. A logical thread ID remains accepted when unambiguous. `resume` emits the provider's logical thread ID.
+
+```bash
+agent-sessions show <id> experiments.md --json --limit 20 --max-chars 0
+```
+
+Matching turns include their source `line`; Codex turns also include the physical `source` path. With a positive `--max-chars`, long matches return an excerpt around the first occurrence and set `text_truncated: true`. Use `--max-chars 0` to read complete matching turns before drawing conclusions from a decision or measurement. A query can miss later updates that use different wording; matching turns alone do not establish the final session state.
+
+For a previous shell command or tool input, use `calls` on the selected session:
+
+```bash
+agent-sessions calls <id> pcap-dir --json --limit 5 --max-chars 500
+```
+
+The query matches call IDs, tool names, and complete inputs without regard to case. Filtering happens before limiting. Results retain transcript order and include the call ID, tool name, timestamp when recorded, source line, and an `input` string. Long inputs become excerpts around the match and set `input_truncated: true`. A call records an attempt; this command does not read results or establish success.
+
+Use jq to select fields while retaining the partial-result warning:
+
+```bash
+agent-sessions calls <id> pcap-dir --json --limit 5 |
+  jq '{truncated, calls: [.data.calls[] | {id,tool,source,line,input,input_truncated}]}'
+```
+
+To inspect a complete input, query its call ID with `--max-chars 0`. For a Claude `Bash` call, the complete `input` can then be decoded with `jq -r '.data.calls[].input | fromjson | .command'`. Custom tool inputs may be plain text instead of JSON. jq sees only returned records, so downstream filtering cannot find calls omitted by `--limit`. Keep JSON intact; use native limits and jq projections instead of `head -c`.
+
+Search reports a failure if an indexed transcript cannot be read. It does not present an incomplete search as zero matches. Malformed JSON records are skipped so an unfinished final line does not prevent reading an active session.
 
 ### Why structured output rather than grep
 
@@ -84,7 +118,7 @@ Where this tool differs:
 
 - **File recovery.** `files`/`cat`/`diff` retrieve a file as it existed in a past session. cass indexes conversations; it does not reconstruct file content.
 - **Codex's own thread index.** Discovery reads `state_<n>.sqlite` — the database `codex resume` itself trusts — so titles, archived state and token totals match what Codex reports. Other tools read the rollout JSONL only.
-- **Scope.** Two agents, ~1,500 lines, no embeddings, no daemon, no model downloads.
+- **Scope.** Two agents, no embeddings, no daemon, no model downloads.
 
 The honest gap is search cost. This greps every transcript per query at ~500 MB/s: **~4 s over 3 GB, ~12 s over 6 GB with subagents.** A prebuilt inverted index answers in milliseconds. That is fine for occasional recall and wrong for a tight loop — if you start calling `search` repeatedly, use cass.
 
@@ -93,44 +127,50 @@ The honest gap is search cost. This greps every transcript per query at ~500 MB/
 | Key | Action |
 |-----|--------|
 | `↑/k` `↓/j`, `g`/`G`, `Ctrl+u`/`Ctrl+d` | Navigate |
-| `/` | Search · `Tab` fuzzy ↔ deep · `Esc` clear |
-| `s` `p` `d` | Cycle sort / project / date |
-| `f` | Cycle agent filter (all → claude → codex) |
+| `/` | Search sessions · `Ctrl+s` titles/metadata ↔ transcript · `↑↓` select while typing |
+| `Tab` | Focus the list or preview |
+| `s` `p` `d` | Choose sort order / project / date range from a searchable list |
+| `f` | Choose an agent filter (all, Claude, Codex) |
 | `a` | Show/hide subagent threads |
-| `Enter` | Resume · `y` copy id · `q` quit |
+| `o` | Browse recorded files; `Tab` focus list/content, `↑↓` navigate, `PgUp/PgDn` scroll, `Esc` return |
+| `[` / `]` | Scroll the conversation preview |
+| `Ctrl+k` / `F1` | Open actions for the current view; type to filter, `↑↓` select, `Enter` apply, `Esc` cancel |
+| `?` | Open actions when not editing a search field |
+| `Enter` | Read the selected conversation; `/` find text, `n`/`N` next/previous match, `Esc` return |
+| `r` | Resume · `y` copy id · `q` quit |
 
-```
-╭─ Search: [__________]         fuzzy  +sub  S:modified  4/4 ──────────────────╮
-├──────────────────────────────────────┬───────────────────────────────────────┤
-│ ▸ 1h ago 019fa425-796  cx  gpt-5.6-  │ 019fa425-7964-7041-b895-b331deb81e89  │
-│   ~/Documents/motion                 │ Project:  ~/Documents/motion          │
-│   Audit the repository               │ Branch:   codex/motion                │
-│   2h ago 21ce0506-676  cc  opus-4.6  │ Tokens:   in: 12K  out: 8.5K          │
-│   ~/work/api                         │ Tools:    exec_command, query_docs    │
-│   Fix auth middleware                │ Files:    5 — auth.go, main.go…       │
-├──────────────────────────────────────┴───────────────────────────────────────┤
-│ ↑↓ nav  / search  tab deep  s sort  p project  d date  f agent  a subagents  │
-╰──────────────────────────────────────────────────────────────────────────────╯
-```
+Actions stay available while editing a query and in the conversation and file views. Canceling keeps the previous query, selection, and focus. Navigation acts on the focused pane; `g/G` in the preview scrolls it without changing the selected session.
+
+Each two-line entry starts with a persistent Claude or Codex badge, followed by its title and project/date metadata. Provider colors stay separate from the selected-entry highlight. The palette adapts to light and dark terminals; names and selection markers remain visible without color. Long queries scroll inside the search field. Below 90 columns, the list sits above the preview. The browser needs at least 40 columns and 18 rows.
+
+The preview and reader distinguish literal user prompts from Markdown answers, including headings, emphasis, lists, links, and syntax-highlighted code. In the reader, `m` switches between Markdown and source text, preserving original code indentation in source mode. Search works on the displayed text. The reader loads beyond the 30-message preview and stops after the message that crosses 8 MiB of conversation text; use `show` for the remaining records. Returning keeps the search and selected session. These views contain conversation text; they do not yet display tool activity or reasoning blocks.
+
+The TUI uses Bubble Tea 2, Bubbles 2, and Lip Gloss 2 and requires Go 1.26 or later to build. Scrolling and reader search highlights use Bubbles viewports. Conversation formatting runs in the background, so you can leave the reader while a long conversation loads. Switching back from source reuses the last Markdown layout when the width and theme still match.
+
+The file browser is read-only. It distinguishes historical file content from recorded diffs and shows recovery provenance. These records do not establish the final filesystem state. File previews show up to 64 KiB; use `cat` or `diff` for the complete record.
 
 ## File recovery
 
-`files` reports `kind` (`add`/`update`/`delete`), `revisions`, and `recoverable`. What is recoverable differs by agent, and the difference is architectural rather than an oversight:
+`files` reports `kind` (`add`/`update`/`delete`), `revisions`, and `recoverable`. Claude results also identify `recovery_source` as `claude_checkpoint` or `claude_write`. `recovery_earlier_version: true` means a newer recorded checkpoint is unavailable and `cat` returns an earlier version. Check this metadata before restoring a file.
 
 | | Claude Code | Codex |
 |---|---|---|
 | Model | snapshots **state** | journals **transitions** |
-| Store | `~/.claude/file-history/<session>/<hash>@vN` | inline in the rollout |
-| Added / deleted files | byte-exact | byte-exact |
-| Modified files | **byte-exact, every revision** | **unified diff only** |
+| Store | checkpoint files and successful `Write` results in the transcript | inline in the rollout |
+| Added / deleted files | available checkpoint bytes | recorded content, when present |
+| Modified files | latest recoverable recorded content | **unified diff only** |
 
-Claude writes each tracked revision to disk, so restoring is a file read. Codex records what changed, not what things were — for adds and deletes those collapse to the same thing, for updates they don't. `cat` therefore fails on a Codex update with `not_recoverable` and points at `diff`.
+Claude recovery selects the latest readable checkpoint or confirmed `Write` result in transcript order. Repeated references to the same checkpoint count once. A `Write` result must match its tool call and report success; pending or failed requests are excluded. These bytes are a historical version, not necessarily the session's final file.
+
+[Claude checkpoints](https://code.claude.com/docs/en/checkpointing) exclude shell edits and expire with session retention. Python, shell scripts, MCP tools, and other programs may change files without recording their bytes. This tool does not execute logged code or infer file contents from commands. Successful Claude `Edit` results can contain captured originals, but reconstructing those edits is not currently supported; their checkpoints remain usable.
+
+Codex recovery uses successful patch records. Failed or declined changes are excluded, and an empty stored file is recoverable. Updates contain a unified diff rather than complete file contents, so `cat` returns `not_recoverable` and points at `diff`.
 
 ## How it works
 
 ### Claude Code
 
-`~/.claude/projects/<encoded-dir>/` (honours `CLAUDE_CONFIG_DIR`). A `sessions-index.json` covers some sessions; the rest are read from the transcript head, parsing only line 0 and lines containing `"type":"user"`.
+`~/.claude/projects/<encoded-dir>/` (honours `CLAUDE_CONFIG_DIR`). A `sessions-index.json` covers some sessions; the rest are read from the first 100 transcript lines, including user messages and working-directory metadata. The JSONL entry format is internal to Claude Code, not a stable public contract.
 
 Project paths resolve in order: `originalPath` from a `sessions-index.json` → its `projectPath` → the `cwd` recorded in the transcript → the decoded directory name.
 
@@ -142,20 +182,22 @@ Subagent transcripts (`<parent>/subagents/agent-*.jsonl`) are indexed but hidden
 
 ### Codex
 
-One rollout per thread at `~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<uuid>.jsonl` (honours `CODEX_HOME`). Every line is `{timestamp, type, payload}`:
+Rollouts live under `~/.codex/sessions/` and `archived_sessions/` (honours `CODEX_HOME`). Older files commonly use `YYYY/MM/DD/rollout-<ISO>-<uuid>.jsonl`. Reverted threads can retain multiple physical rollouts; their archive IDs distinguish them. Readers follow `history_base` references across both directories, preserving each ancestor's byte and ordinal cutoffs. Conversation, calls, recovery, and preview metrics use that same history. Missing, ambiguous, compressed, or invalid referenced history fails explicitly. Lines use `{timestamp, type, payload}`:
 
 | Line | Carries |
 |------|---------|
 | `session_meta` (first) | thread id, cwd, git branch, cli version, `thread_source` |
 | `turn_context` | model, reasoning effort, sandbox policy |
 | `event_msg` / `user_message`, `agent_message` | the conversation |
+| `response_item` / `message` | user `input_text` and assistant `output_text`; preferred over duplicate legacy events |
 | `event_msg` / `token_count` | **running totals** — the last one wins, they are not summed |
-| `event_msg` / `patch_apply_end` | `changes`: content for add/delete, `unified_diff` for update |
-| `response_item` / `function_call` | tool names |
+| `event_msg` / successful `patch_apply_end` | `changes`: content for add/delete, `unified_diff` for update |
+| `event_msg` / `item_completed` with completed `FileChange` | newer patch records with the same change data |
+| `response_item` / `function_call`, `custom_tool_call` | tool names |
 
 Discovery prefers Codex's own SQLite thread index (`~/.codex/state_<n>.sqlite`, the same one `codex resume` trusts), opened read-only with a busy timeout. It supplies title, token total, model, git branch and archived state without reading a transcript.
 
-It is treated as a fast path, not gospel — the highest-numbered `state_<n>.sqlite` wins since the suffix bumps on migrations; columns are probed via `PRAGMA table_info` because the table has grown by `ALTER TABLE`; ghost rows are dropped; rows with no title get their prompt backfilled from the transcript; and if the database is unreadable a parallel rollout walk replaces it entirely. That fallback is not hypothetical: reading the live database fails transiently while Codex checkpoints.
+The highest-numbered `state_<n>.sqlite` wins. Columns are probed via `PRAGMA table_info`, and untitled rows get their prompt backfilled from the transcript. Missing legacy rollouts are skipped. A missing selected paginated rollout produces `store_unavailable`; substituting an older rollout would return the wrong history. An absent or unreadable database falls back to a parallel rollout scan.
 
 ### Session ids
 

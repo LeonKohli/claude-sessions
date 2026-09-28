@@ -20,6 +20,7 @@ archives:
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
       - README.md
+      - docs/storage-contract.md
       - skills/search-sessions/SKILL.md
       - skills/search-sessions/scripts/search.sh
 checksum:
