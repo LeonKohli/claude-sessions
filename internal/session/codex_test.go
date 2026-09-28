@@ -1,10 +1,13 @@
 package session
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/LeonKohli/claude-sessions/internal/provider"
 )
 
 // A rollout that exercises the shapes this package cares about: the leading
@@ -117,7 +120,7 @@ func TestReadCodexHeadPastDeepPreamble(t *testing.T) {
 }
 
 func TestReadCodexMessages(t *testing.T) {
-	msgs, err := ReadCodexMessages(writeRollout(t, sampleRollout), 30)
+	msgs, err := ReadPreview(provider.Codex, writeRollout(t, sampleRollout), 30)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,8 +166,8 @@ func TestEnrichCodexSession(t *testing.T) {
 	}
 }
 
-func TestReadCodexTextForSearch(t *testing.T) {
-	lines, err := ReadCodexText(writeRollout(t, sampleRollout))
+func TestCodexConversationText(t *testing.T) {
+	lines, err := collectCodexText(writeRollout(t, sampleRollout))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +187,7 @@ func TestCodexReadersTolerateMalformedLines(t *testing.T) {
 	if _, _, _, _, ok := ReadCodexHead(path); !ok {
 		t.Error("ReadCodexHead failed on trailing garbage")
 	}
-	if msgs, err := ReadCodexMessages(path, 30); err != nil || len(msgs) != 2 {
+	if msgs, err := ReadPreview(provider.Codex, path, 30); err != nil || len(msgs) != 2 {
 		t.Errorf("ReadCodexMessages: %d msgs, err %v", len(msgs), err)
 	}
 	if _, err := EnrichCodexSession(path); err != nil {
@@ -205,4 +208,58 @@ func TestShortenModelLeavesCodexIDsAlone(t *testing.T) {
 			t.Errorf("ShortenModel(%q) = %q, want %q", in, got, want)
 		}
 	}
+}
+
+func TestCodexResponseMessages(t *testing.T) {
+	response := `{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"modern prompt"}]}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"modern reply"}]}}
+`
+	legacy := `{"type":"event_msg","payload":{"type":"user_message","message":"modern prompt"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"modern reply"}}
+`
+	for _, body := range []string{response, legacy + response} {
+		path := writeRollout(t, body)
+		msgs, err := ReadPreview(provider.Codex, path, 10)
+		if err != nil || len(msgs) != 2 || msgs[0].Text != "modern prompt" || msgs[1].Text != "modern reply" {
+			t.Fatalf("response conversation = %v, err %v", msgs, err)
+		}
+		lines, err := collectCodexText(path)
+		if err != nil || len(lines) != 2 || lines[1].Text != "modern reply" {
+			t.Fatalf("searchable conversation = %v, err %v", lines, err)
+		}
+	}
+}
+
+func BenchmarkReadCodexMessages(b *testing.B) {
+	path := filepath.Join(b.TempDir(), "rollout.jsonl")
+	if err := os.WriteFile(path, []byte(sampleRollout), 0600); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := ReadPreview(provider.Codex, path, 30); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestCodexLimitedReadPrefersResponseAfterLegacyEvents(t *testing.T) {
+	path := writeRollout(t, `{"type":"event_msg","payload":{"type":"user_message","message":"legacy duplicate"}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"canonical response"}]}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"later duplicate"}}
+`)
+	messages, err := ReadPreview(provider.Codex, path, 1)
+	if err != nil || len(messages) != 1 || messages[0].Role != "assistant" || messages[0].Text != "canonical response" {
+		t.Fatalf("limited conversation = %+v, error = %v", messages, err)
+	}
+}
+
+func collectCodexText(path string) ([]SearchableLine, error) {
+	var lines []SearchableLine
+	err := WalkCodexText(context.Background(), path, func(line SearchableLine) bool {
+		lines = append(lines, line)
+		return true
+	})
+	return lines, err
 }

@@ -1,12 +1,16 @@
 package index
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -25,17 +29,10 @@ import (
 func ScanCodex() ([]session.SessionEntry, error) {
 	if entries, err := scanCodexStateDB(); err == nil && len(entries) > 0 {
 		return entries, nil
+	} else if errors.Is(err, ErrStoreUnavailable) {
+		return nil, err
 	}
 	return scanCodexRollouts()
-}
-
-// codexColumns are the threads columns we read when present. The table has
-// grown by ALTER TABLE across releases, so every optional column is probed
-// against PRAGMA table_info rather than assumed.
-var codexOptionalColumns = []string{
-	"model", "git_branch", "thread_source", "agent_nickname", "agent_role",
-	"first_user_message", "created_at_ms", "updated_at_ms", "archived",
-	"tokens_used", "title", "source",
 }
 
 func scanCodexStateDB() ([]session.SessionEntry, error) {
@@ -46,56 +43,58 @@ func scanCodexStateDB() ([]session.SessionEntry, error) {
 
 	// Read-only with a short busy timeout: Codex may be mid-write, and we must
 	// never mutate its live index.
-	db, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro&_pragma=busy_timeout(3000)")
+	db, err := sql.Open("sqlite", (&url.URL{Scheme: "file", Path: dbPath, RawQuery: "mode=ro&_pragma=busy_timeout(3000)"}).String())
 	if err != nil {
 		return nil, err
 	}
 	defer db.Close()
 
-	present, err := codexTableColumns(db)
-	if err != nil {
-		return nil, err
-	}
-	for _, required := range []string{"id", "rollout_path", "cwd", "created_at", "updated_at"} {
-		if !present[required] {
-			return nil, fmt.Errorf("threads table missing %q", required)
-		}
-	}
-
-	cols := []string{"id", "rollout_path", "cwd", "created_at", "updated_at"}
-	for _, c := range codexOptionalColumns {
-		if present[c] {
-			cols = append(cols, c)
-		}
-	}
-
-	rows, err := db.Query("SELECT " + strings.Join(cols, ", ") + " FROM threads")
+	rows, err := db.Query("SELECT * FROM threads")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	for _, required := range []string{"id", "rollout_path", "cwd", "created_at", "updated_at"} {
+		if !slices.Contains(cols, required) {
+			return nil, fmt.Errorf("threads table missing %q", required)
+		}
+	}
 
 	var entries []session.SessionEntry
 	for rows.Next() {
-		vals := make([]any, len(cols))
+		vals := make([]sql.RawBytes, len(cols))
+		dest := make([]any, len(cols))
 		for i := range vals {
-			vals[i] = new(sql.RawBytes)
+			dest[i] = &vals[i]
 		}
-		if err := rows.Scan(vals...); err != nil {
+		if err := rows.Scan(dest...); err != nil {
 			return nil, err
 		}
 		field := make(map[string]string, len(cols))
 		for i, c := range cols {
-			field[c] = string(*(vals[i].(*sql.RawBytes)))
+			field[c] = string(vals[i])
 		}
 
 		path := field["rollout_path"]
 		// Rows can outlive their file after manual cleanup or a migration.
 		info, err := os.Stat(path)
 		if err != nil {
+			if field["history_mode"] == "paginated" {
+				return nil, fmt.Errorf("%w: selected rollout for %s: %w", ErrStoreUnavailable, field["id"], err)
+			}
 			continue
 		}
 
+		meta := session.CodexMeta{
+			ThreadSource: field["thread_source"],
+			Source:       json.RawMessage(field["source"]),
+			Nickname:     field["agent_nickname"],
+			Role:         field["agent_role"],
+		}
 		e := session.SessionEntry{
 			Provider:    provider.Codex,
 			SessionID:   field["id"],
@@ -108,8 +107,8 @@ func scanCodexStateDB() ([]session.SessionEntry, error) {
 			Created:     codexTime(field["created_at_ms"], field["created_at"]),
 			Modified:    codexTime(field["updated_at_ms"], field["updated_at"]),
 			Archived:    field["archived"] == "1",
-			IsSubagent:  field["thread_source"] == "subagent" || strings.Contains(field["source"], "subagent"),
-			AgentLabel:  joinAgentLabel(field["agent_nickname"], field["agent_role"]),
+			IsSubagent:  meta.IsSubagent(),
+			AgentLabel:  meta.AgentLabel(),
 			Parent:      codexParentFromSource(field["source"]),
 			FileMtime:   info.ModTime().UnixMilli(),
 			FileSize:    info.Size(),
@@ -126,7 +125,7 @@ func scanCodexStateDB() ([]session.SessionEntry, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	return backfillUntitled(entries), nil
+	return backfillUntitled(entries)
 }
 
 // backfillUntitled recovers display text for threads the state database never
@@ -134,7 +133,9 @@ func scanCodexStateDB() ([]session.SessionEntry, error) {
 // while their transcript holds a real prompt, so trusting the database alone
 // would hide them. Entries with no prompt in either place have no conversation
 // and are dropped.
-func backfillUntitled(entries []session.SessionEntry) []session.SessionEntry {
+func backfillUntitled(entries []session.SessionEntry) ([]session.SessionEntry, error) {
+	reader := new(session.CodexReader)
+	readErrors := make([]error, len(entries))
 	var pending []int
 	for i, e := range entries {
 		if e.Summary == "" && e.FirstPrompt == "" {
@@ -155,7 +156,11 @@ func backfillUntitled(entries []session.SessionEntry) []session.SessionEntry {
 			go func() {
 				defer wg.Done()
 				for i := range jobs {
-					_, prompt, model, _, ok := session.ReadCodexHead(entries[i].FullPath)
+					_, prompt, model, _, ok, err := reader.ReadHead(context.Background(), entries[i].FullPath)
+					if err != nil {
+						readErrors[i] = err
+						continue
+					}
 					if !ok {
 						continue
 					}
@@ -168,6 +173,11 @@ func backfillUntitled(entries []session.SessionEntry) []session.SessionEntry {
 		}
 		wg.Wait()
 	}
+	for i, err := range readErrors {
+		if err != nil {
+			return nil, fmt.Errorf("%w: %s: %w", ErrStoreUnavailable, entries[i].FullPath, err)
+		}
+	}
 
 	kept := entries[:0]
 	for _, e := range entries {
@@ -176,50 +186,34 @@ func backfillUntitled(entries []session.SessionEntry) []session.SessionEntry {
 		}
 		kept = append(kept, e)
 	}
-	return kept
-}
-
-func codexTableColumns(db *sql.DB) (map[string]bool, error) {
-	rows, err := db.Query("PRAGMA table_info(threads)")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	present := make(map[string]bool)
-	for rows.Next() {
-		var cid int
-		var name, ctype string
-		var notNull, pk int
-		var dflt sql.RawBytes
-		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
-			return nil, err
-		}
-		present[name] = true
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	if len(present) == 0 {
-		return nil, fmt.Errorf("no threads table")
-	}
-	return present, nil
+	return kept, nil
 }
 
 // scanCodexRollouts reads session_meta headers straight from the rollout files.
 // Used when the state database is absent or unreadable.
 func scanCodexRollouts() ([]session.SessionEntry, error) {
+	reader := new(session.CodexReader)
 	var paths []string
 	for _, root := range []string{provider.CodexSessionsDir(), provider.CodexArchivedDir()} {
-		archived := root == provider.CodexArchivedDir()
-		filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
-			if err != nil || d.IsDir() || !strings.HasSuffix(p, ".jsonl") {
+		err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+			if err != nil {
+				if p == root && os.IsNotExist(err) {
+					return nil
+				}
+				return err
+			}
+			if p == root && !d.IsDir() {
+				return fmt.Errorf("%s is not a directory", root)
+			}
+			if d.IsDir() || !strings.HasSuffix(p, ".jsonl") {
 				return nil
 			}
 			paths = append(paths, p)
-			_ = archived
 			return nil
 		})
+		if err != nil {
+			return nil, err
+		}
 	}
 	if len(paths) == 0 {
 		return nil, nil
@@ -233,6 +227,7 @@ func scanCodexRollouts() ([]session.SessionEntry, error) {
 
 	archivedDir := provider.CodexArchivedDir()
 	results := make(chan session.SessionEntry, len(paths))
+	readErrors := make(chan error, len(paths))
 	var wg sync.WaitGroup
 	for i := 0; i < runtime.NumCPU(); i++ {
 		wg.Add(1)
@@ -243,7 +238,11 @@ func scanCodexRollouts() ([]session.SessionEntry, error) {
 				if err != nil {
 					continue
 				}
-				meta, prompt, model, ts, ok := session.ReadCodexHead(path)
+				meta, prompt, model, ts, ok, err := reader.ReadHead(context.Background(), path)
+				if err != nil {
+					readErrors <- fmt.Errorf("%w: %s: %w", ErrStoreUnavailable, path, err)
+					continue
+				}
 				if !ok {
 					continue
 				}
@@ -277,6 +276,10 @@ func scanCodexRollouts() ([]session.SessionEntry, error) {
 	}
 	wg.Wait()
 	close(results)
+	close(readErrors)
+	for err := range readErrors {
+		return nil, err
+	}
 
 	var entries []session.SessionEntry
 	for e := range results {
@@ -301,17 +304,6 @@ func codexIDFromFilename(path string) string {
 		return base[20:]
 	}
 	return base
-}
-
-func joinAgentLabel(nickname, role string) string {
-	switch {
-	case nickname != "" && role != "":
-		return nickname + "/" + role
-	case nickname != "":
-		return nickname
-	default:
-		return role
-	}
 }
 
 // shortIDLen is deliberately longer than the conventional 8. Codex ids are

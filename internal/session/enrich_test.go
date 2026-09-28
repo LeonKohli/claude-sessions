@@ -1,6 +1,33 @@
 package session
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestClaudeUsageCountsResponsesNotContentFragments(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.jsonl")
+	body := `{"type":"user","message":{"role":"user","content":"question"}}
+{"type":"assistant","message":{"id":"response-one","role":"assistant","usage":{"input_tokens":3,"output_tokens":1,"cache_creation_input_tokens":10174},"content":[{"type":"thinking","thinking":"reasoning"}]}}
+{"type":"assistant","message":{"id":"response-one","role":"assistant","usage":{"input_tokens":3,"output_tokens":11,"cache_creation_input_tokens":10174},"content":[{"type":"text","text":"answer"}]}}
+{"type":"assistant","message":{"id":"response-one","role":"assistant","usage":{"input_tokens":3,"output_tokens":11,"cache_creation_input_tokens":10174},"content":[{"type":"tool_use","name":"Read"}]}}
+{"type":"assistant","message":{"id":"response-two","role":"assistant","usage":{"input_tokens":7,"output_tokens":2},"content":[{"type":"text","text":"next answer"}]}}
+`
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := EnrichClaudeSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TotalInputTokens != 10 || got.TotalOutputTokens != 13 || got.CacheWriteTokens != 10174 || got.MessageCount != 3 {
+		t.Fatalf("usage counted fragments or missed the final usage: %+v", got)
+	}
+	if len(got.ToolsUsed) != 1 || got.ToolsUsed[0] != "Read" {
+		t.Fatalf("lost tool from another fragment: %v", got.ToolsUsed)
+	}
+}
 
 // Claude records tracked files relative to the project root and keeps the real
 // directory alongside. Codex always reports absolute paths, so Claude's must be

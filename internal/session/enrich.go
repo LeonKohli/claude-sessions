@@ -1,7 +1,6 @@
 package session
 
 import (
-	"bufio"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -12,6 +11,7 @@ import (
 type enrichLine struct {
 	Type    string `json:"type"`
 	Message *struct {
+		ID      string          `json:"id"`
 		Role    string          `json:"role"`
 		Model   string          `json:"model"`
 		Usage   *Usage          `json:"usage"`
@@ -52,20 +52,13 @@ func EnrichClaudeSession(path string) (*EnrichmentData, error) {
 	modelCounts := make(map[string]int)
 	toolSet := make(map[string]bool)
 	fileSet := make(map[string]bool)
+	responses := make(map[string]Usage)
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 2*1024*1024), 2*1024*1024)
-
-	for scanner.Scan() {
-		raw := scanner.Bytes()
-		s := string(raw)
-
-		// Fast path: skip lines that aren't interesting
-		isAssistant := strings.Contains(s, `"type": "assistant"`) || strings.Contains(s, `"type":"assistant"`)
-		isUser := strings.Contains(s, `"type": "user"`) || strings.Contains(s, `"type":"user"`)
-		isSnapshot := strings.Contains(s, `"file-history-snapshot"`)
-
-		if !isAssistant && !isUser && !isSnapshot {
+	for raw, err := range readLines(f) {
+		if err != nil {
+			return data, err
+		}
+		if !mayContainJSONStrings(raw, "assistant", "user", "file-history-snapshot") {
 			continue
 		}
 
@@ -75,22 +68,31 @@ func EnrichClaudeSession(path string) (*EnrichmentData, error) {
 		}
 
 		// Count messages
+		seenResponse := false
+		if line.Type == "assistant" && line.Message != nil && line.Message.ID != "" {
+			_, seenResponse = responses[line.Message.ID]
+		}
 		if (line.Type == "user" || line.Type == "assistant") && line.Message != nil {
-			if line.Message.Role == "user" || line.Message.Role == "assistant" {
+			if !seenResponse && (line.Message.Role == "user" || line.Message.Role == "assistant") {
 				data.MessageCount++
 			}
 		}
 
 		// Extract token usage from assistant messages
 		if line.Type == "assistant" && line.Message != nil {
+			previous := responses[line.Message.ID]
 			if line.Message.Usage != nil {
 				u := line.Message.Usage
-				data.TotalInputTokens += u.InputTokens
-				data.TotalOutputTokens += u.OutputTokens
-				data.CacheReadTokens += u.CacheReadInputTokens
-				data.CacheWriteTokens += u.CacheCreationInputTokens
+				data.TotalInputTokens += u.InputTokens - previous.InputTokens
+				data.TotalOutputTokens += u.OutputTokens - previous.OutputTokens
+				data.CacheReadTokens += u.CacheReadInputTokens - previous.CacheReadInputTokens
+				data.CacheWriteTokens += u.CacheCreationInputTokens - previous.CacheCreationInputTokens
+				previous = *u
 			}
-			if line.Message.Model != "" {
+			if line.Message.ID != "" {
+				responses[line.Message.ID] = previous
+			}
+			if !seenResponse && line.Message.Model != "" {
 				modelCounts[line.Message.Model]++
 			}
 
@@ -126,7 +128,7 @@ func EnrichClaudeSession(path string) (*EnrichmentData, error) {
 		data.FilesModified = append(data.FilesModified, file)
 	}
 
-	return data, scanner.Err()
+	return data, nil
 }
 
 // extractToolNames finds tool_use blocks in the content array.

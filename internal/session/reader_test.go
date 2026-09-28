@@ -1,10 +1,71 @@
 package session
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/LeonKohli/claude-sessions/internal/provider"
 )
+
+func TestConversationReadersPreserveTextAcrossJSONEncodings(t *testing.T) {
+	for _, p := range []provider.Kind{provider.Claude, provider.Codex} {
+		for _, encoding := range []string{"compact", "spaced", "escaped"} {
+			t.Run(p.String()+"/"+encoding, func(t *testing.T) {
+				body := `{"type":"assistant","message":{"role":"assistant","content":"  answer\n    code\n"}}`
+				if p == provider.Codex {
+					body = `{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"  answer\n    code\n"}]}}`
+				}
+				if encoding == "spaced" {
+					body = strings.ReplaceAll(body, ":", " :\t ")
+				} else if encoding == "escaped" {
+					body = strings.NewReplacer("type", `ty\u0070e`, "assistant", `\u0061ssistant`, "response_item", `\u0072esponse_item`).Replace(body)
+				}
+				path := filepath.Join(t.TempDir(), "session.jsonl")
+				if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+					t.Fatal(err)
+				}
+				want := "  answer\n    code\n"
+				preview, err := ReadPreview(p, path, 1)
+				if err != nil || len(preview) != 1 || preview[0].Text != want {
+					t.Errorf("preview lost text: %+v, %v", preview, err)
+				}
+				var turns []SearchableLine
+				err = WalkSearchable(context.Background(), p, path, func(line SearchableLine) bool {
+					turns = append(turns, line)
+					return true
+				})
+				if err != nil || len(turns) != 1 || turns[0].Text != want || turns[0].LineNum != 1 {
+					t.Errorf("search lost text or provenance: %+v, %v", turns, err)
+				}
+				usage, err := Enrich(p, path)
+				if err != nil || usage.MessageCount != 1 {
+					t.Errorf("usage disagrees with conversation: %+v, %v", usage, err)
+				}
+			})
+		}
+	}
+}
+
+func TestClaudeConversationExcludesNonMessageRecords(t *testing.T) {
+	body := `{"type":"progress","data":{"type":"user"},"message":{"role":"user","content":"not a conversation turn"}}
+{"type":"assistant","message":{"role":"assistant","content":"recorded answer"}}
+`
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var turns []SearchableLine
+	err := WalkSearchable(context.Background(), provider.Claude, path, func(line SearchableLine) bool {
+		turns = append(turns, line)
+		return true
+	})
+	if err != nil || len(turns) != 1 || turns[0].Text != "recorded answer" || turns[0].LineNum != 2 {
+		t.Fatalf("non-message record leaked into conversation: %+v, %v", turns, err)
+	}
+}
 
 // Claude transcripts open with bookkeeping records whose cwd is null. Reading
 // the working directory from line 0 alone leaves it empty, which forces the
@@ -38,6 +99,31 @@ func TestReadFirstUserPromptFindsCWDPastNullPreamble(t *testing.T) {
 	}
 	if ts.IsZero() {
 		t.Error("timestamp not captured")
+	}
+}
+
+func TestReadersContinuePastLargeToolOutput(t *testing.T) {
+	for _, codex := range []bool{false, true} {
+		body := `{"type":"tool_output","content":"` + strings.Repeat("x", 9<<20) + "\"}\n"
+		if codex {
+			body += `{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"after large output"}]}}`
+		} else {
+			body += `{"type":"assistant","message":{"role":"assistant","content":"after large output"}}`
+		}
+		path := filepath.Join(t.TempDir(), "large.jsonl")
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		var msgs []PreviewMessage
+		var err error
+		if codex {
+			msgs, err = ReadPreview(provider.Codex, path, 10)
+		} else {
+			msgs, err = ReadPreview(provider.Claude, path, 10)
+		}
+		if err != nil || len(msgs) != 1 || msgs[0].Text != "after large output" {
+			t.Errorf("codex=%v: messages=%v err=%v", codex, msgs, err)
+		}
 	}
 }
 

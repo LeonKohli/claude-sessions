@@ -20,6 +20,7 @@ type PreviewLoadedMsg struct {
 type DeepSearchResultMsg struct {
 	Query   string
 	Results []DeepMatch
+	Err     error
 }
 
 // DeepMatch is a session that matched a deep search.

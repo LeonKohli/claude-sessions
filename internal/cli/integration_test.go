@@ -38,7 +38,7 @@ func TestCommandsWithRelocatedStores(t *testing.T) {
 	write(filepath.Join(root, "codex/sessions/2026/09/26/rollout-2026-09-26T08-00-00-codex-fixture.jsonl"),
 		`{"timestamp":"2026-09-26T08:00:00Z","type":"session_meta","payload":{"id":"codex-fixture","cwd":`+string(quotedProject)+`}}`+"\n"+
 			`{"timestamp":"2026-09-26T08:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"portability needle"}}`+"\n"+
-			`{"timestamp":"2026-09-26T08:00:02Z","type":"event_msg","payload":{"type":"patch_apply_end","changes":{"hello.txt":{"type":"add","content":"hello\n"}}}}`+"\n")
+			`{"timestamp":"2026-09-26T08:00:02Z","type":"event_msg","payload":{"type":"patch_apply_end","success":true,"changes":{"hello.txt":{"type":"add","content":"hello\n"}}}}`+"\n")
 	claudePath := filepath.Join(root, "claude/projects/custom/claude-fixture.jsonl")
 	old := time.Now().Add(-24 * time.Hour)
 	if err := os.Chtimes(claudePath, old, old); err != nil {

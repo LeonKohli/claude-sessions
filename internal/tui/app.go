@@ -235,6 +235,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case DeepSearchResultMsg:
 		m.deepSearching = false
+		if msg.Err != nil {
+			m.toast = msg.Err.Error()
+			return m, nil
+		}
 		m.deepResults = make(map[string][]string)
 		for _, r := range msg.Results {
 			m.deepResults[r.Session.SessionID] = r.Snippets
@@ -666,8 +670,8 @@ func (m Model) runDeepSearch(query string) tea.Cmd {
 
 	sessions := m.allSessions
 	return func() tea.Msg {
-		results := deepSearch(sessions, query)
-		return DeepSearchResultMsg{Query: query, Results: results}
+		results, err := deepSearch(context.Background(), sessions, query)
+		return DeepSearchResultMsg{Query: query, Results: results, Err: err}
 	}
 }
 

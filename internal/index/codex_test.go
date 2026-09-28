@@ -1,6 +1,9 @@
 package index
 
 import (
+	"database/sql"
+	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -8,74 +11,39 @@ import (
 	"github.com/LeonKohli/claude-sessions/internal/provider"
 )
 
-// TestCodexScanPathsAgree runs both Codex discovery strategies over the real
-// store and asserts they describe the same threads. The SQLite index is the
-// fast path; the rollout walk is the fallback when it is missing or its schema
-// has drifted, so the two must not disagree about what exists.
-func TestCodexScanPathsAgree(t *testing.T) {
-	if provider.CodexStateDB() == "" {
-		t.Skip("no codex state database on this machine")
-	}
-
-	fromDB, err := scanCodexStateDB()
-	if err != nil {
-		t.Fatalf("state db scan: %v", err)
-	}
-	fromFiles, err := scanCodexRollouts()
-	if err != nil {
-		t.Fatalf("rollout scan: %v", err)
-	}
-	t.Logf("state db: %d entries, rollout walk: %d entries", len(fromDB), len(fromFiles))
-
-	dbByID := make(map[string]int, len(fromDB))
-	for i, e := range fromDB {
-		if e.SessionID == "" {
-			t.Errorf("state db entry %d has no session id (%s)", i, e.FullPath)
-		}
-		if e.Provider != provider.Codex {
-			t.Errorf("state db entry %s tagged as %s", e.ShortID, e.Provider)
-		}
-		if _, dup := dbByID[e.SessionID]; dup {
-			t.Errorf("duplicate session id %s in state db scan", e.SessionID)
-		}
-		dbByID[e.SessionID] = i
-	}
-
-	// Every thread the rollout walk finds must also be in the state database,
-	// otherwise the fast path is silently hiding sessions.
-	var missing, cwdMismatch, subagentMismatch int
-	for _, f := range fromFiles {
-		i, ok := dbByID[f.SessionID]
-		if !ok {
-			missing++
-			if missing <= 3 {
-				t.Logf("only in rollout walk: %s (%s)", f.ShortID, f.FullPath)
+// A nonempty database selects visible histories; the filesystem is the fallback.
+func TestCodexDiscoveryUsesDatabaseSelectionOrFilesystemFallback(t *testing.T) {
+	for _, database := range []bool{false, true} {
+		t.Run(fmt.Sprintf("database=%t", database), func(t *testing.T) {
+			setupCodexDiscoveryStore(t, database)
+			unindexed := filepath.Join(provider.CodexSessionsDir(), "rollout-unindexed.jsonl")
+			body := `{"type":"session_meta","payload":{"id":"unindexed","cwd":"/work/unindexed"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"unindexed history"}}`
+			if err := os.WriteFile(unindexed, []byte(body), 0600); err != nil {
+				t.Fatal(err)
 			}
-			continue
-		}
-		d := fromDB[i]
-		if d.ProjectPath != f.ProjectPath {
-			cwdMismatch++
-			if cwdMismatch <= 3 {
-				t.Logf("cwd differs for %s: db=%q file=%q", f.ShortID, d.ProjectPath, f.ProjectPath)
+			entries, err := ScanCodex()
+			if err != nil {
+				t.Fatal(err)
 			}
-		}
-		if d.IsSubagent != f.IsSubagent {
-			subagentMismatch++
-			if subagentMismatch <= 3 {
-				t.Logf("subagent flag differs for %s: db=%v file=%v", f.ShortID, d.IsSubagent, f.IsSubagent)
+			want := map[string]bool{"main": false, "child": true}
+			if !database {
+				want["unindexed"] = false
 			}
-		}
-	}
-
-	if missing > 0 {
-		t.Errorf("%d/%d rollouts absent from the state db index", missing, len(fromFiles))
-	}
-	if cwdMismatch > 0 {
-		t.Errorf("%d project paths disagree between the two scans", cwdMismatch)
-	}
-	if subagentMismatch > 0 {
-		t.Errorf("%d subagent classifications disagree between the two scans", subagentMismatch)
+			if len(entries) != len(want) {
+				t.Fatalf("unexpected histories: %+v", entries)
+			}
+			for _, entry := range entries {
+				subagent, exists := want[entry.SessionID]
+				if !exists || entry.Provider != provider.Codex || entry.ProjectPath != "/work/"+entry.SessionID || entry.IsSubagent != subagent {
+					t.Errorf("unexpected session metadata: %+v", entry)
+				}
+				delete(want, entry.SessionID)
+			}
+			if len(want) != 0 {
+				t.Fatalf("missing histories: %v", want)
+			}
+		})
 	}
 }
 
@@ -97,9 +65,10 @@ func TestCodexIDFromFilename(t *testing.T) {
 // fail to open it mid-checkpoint, so discovery must survive its absence by
 // falling back to the rollout files.
 func TestCodexScanFallsBackWithoutStateDB(t *testing.T) {
+	setupCodexDiscoveryStore(t, false)
 	real, err := scanCodexRollouts()
 	if err != nil || len(real) == 0 {
-		t.Skip("no codex rollouts on this machine")
+		t.Fatalf("fixture rollouts were not discovered: %v", err)
 	}
 
 	// A home with transcripts but no state_<n>.sqlite. WalkDir does not follow
@@ -149,12 +118,13 @@ func TestCodexScanFallsBackWithoutStateDB(t *testing.T) {
 // TestCodexEntriesResolveOnDisk guards the ghost-row filter: every indexed
 // session must still have a readable transcript.
 func TestCodexEntriesResolveOnDisk(t *testing.T) {
+	setupCodexDiscoveryStore(t, true)
 	entries, err := ScanCodex()
 	if err != nil {
-		t.Skipf("no codex store: %v", err)
+		t.Fatalf("fixture store scan: %v", err)
 	}
-	if len(entries) == 0 {
-		t.Skip("no codex sessions on this machine")
+	if len(entries) != 2 {
+		t.Fatalf("found %d entries, want the two recorded threads", len(entries))
 	}
 	for _, e := range entries {
 		if _, err := os.Stat(e.FullPath); err != nil {
@@ -162,6 +132,55 @@ func TestCodexEntriesResolveOnDisk(t *testing.T) {
 		}
 		if e.DisplayTitle() == "" {
 			t.Errorf("session %s has no display title", e.ShortID)
+		}
+	}
+}
+
+func setupCodexDiscoveryStore(t *testing.T, database bool) {
+	t.Helper()
+	root := filepath.Join(t.TempDir(), "store?name#fragment")
+	t.Setenv("CODEX_HOME", root)
+	t.Setenv("CODEX_SQLITE_HOME", root)
+	dir := filepath.Join(root, "sessions")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	paths := map[string]string{}
+	for _, id := range []string{"main", "child"} {
+		source := `"cli"`
+		if id == "child" {
+			source = `{"subagent":{"thread_spawn":{"parent_thread_id":"main"}}}`
+		}
+		body := fmt.Sprintf(`{"type":"session_meta","payload":{"id":%q,"cwd":%q,"source":%s}}
+{"type":"event_msg","payload":{"type":"user_message","message":%q}}
+`, id, "/work/"+id, source, "prompt "+id)
+		paths[id] = filepath.Join(dir, "rollout-"+id+".jsonl")
+		if err := os.WriteFile(paths[id], []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !database {
+		return
+	}
+	db, err := sql.Open("sqlite", (&url.URL{Scheme: "file", Path: filepath.Join(root, "state_5.sqlite")}).String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE threads(id TEXT, rollout_path TEXT, cwd TEXT, created_at INTEGER, updated_at INTEGER, thread_source TEXT, extra_future_column TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"main", "child", "deleted"} {
+		source := "cli"
+		if id == "child" {
+			source = "subagent"
+		}
+		path := paths[id]
+		if id == "deleted" {
+			path = filepath.Join(dir, "missing.jsonl")
+		}
+		if _, err := db.Exec(`INSERT INTO threads VALUES(?,?,?,?,?,?,?)`, id, path, "/work/"+id, 1, 2, source, "future metadata"); err != nil {
+			t.Fatal(err)
 		}
 	}
 }

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -184,7 +185,10 @@ func Search(query string, f Filter, snippets, maxChars int) (Result, error) {
 		return Result{}, err
 	}
 
-	hits := index.SearchSessions(sessions, query, snippets, maxChars)
+	hits, err := index.SearchSessions(context.Background(), sessions, query, snippets, maxChars)
+	if err != nil {
+		return Result{}, err
+	}
 	sort.Slice(hits, func(i, j int) bool {
 		if hits[i].Matches != hits[j].Matches {
 			return hits[i].Matches > hits[j].Matches

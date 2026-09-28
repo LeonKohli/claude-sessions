@@ -1,6 +1,9 @@
 package session
 
 import (
+	"context"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/LeonKohli/claude-sessions/internal/provider"
@@ -43,6 +46,21 @@ type SessionEntry struct {
 	Enriched          bool // true once enrichment is done
 }
 
+// ReferenceID identifies a physical archive; SessionID remains the resume target.
+func (s SessionEntry) ReferenceID() string {
+	if s.Provider == provider.Codex {
+		name := strings.TrimSuffix(filepath.Base(s.FullPath), ".jsonl")
+		prefix, rollout, ok := strings.Cut(name, "_")
+		if ok && rollout != "" && strings.HasPrefix(prefix, "rollout-") && strings.HasSuffix(prefix, "-"+s.SessionID) {
+			return s.SessionID + "/" + rollout
+		}
+		if len(s.SessionID) == 36 && strings.HasPrefix(name, "rollout-") && strings.HasSuffix(name, "-"+s.SessionID) {
+			return s.SessionID + "/" + s.SessionID
+		}
+	}
+	return s.SessionID
+}
+
 // Duration returns the wall-clock duration of the session.
 func (s SessionEntry) Duration() time.Duration {
 	if s.Created.IsZero() || s.Modified.IsZero() {
@@ -60,9 +78,9 @@ func (s SessionEntry) TotalTokens() int64 {
 	return s.TotalInputTokens + s.TotalOutputTokens
 }
 
-// EstimatedMessages returns MessageCount if known, else estimates from file size.
+// EstimatedMessages uses a completed scan, then index metadata, then a size estimate.
 func (s SessionEntry) EstimatedMessages() int {
-	if s.MessageCount > 0 {
+	if s.Enriched || s.MessageCount > 0 {
 		return s.MessageCount
 	}
 	// Rough estimate: ~3KB per user+assistant message pair
@@ -108,6 +126,7 @@ type EnrichmentData struct {
 
 // SearchableLine is a text line extracted from a session for deep search.
 type SearchableLine struct {
+	Source    string
 	Text      string
 	Role      string
 	Timestamp time.Time
@@ -116,10 +135,12 @@ type SearchableLine struct {
 
 // ReadPreview loads up to maxMessages conversation turns for the preview pane.
 func ReadPreview(p provider.Kind, path string, maxMessages int) ([]PreviewMessage, error) {
-	if p == provider.Codex {
-		return ReadCodexMessages(path, maxMessages)
-	}
-	return ReadClaudeMessages(path, maxMessages)
+	var messages []PreviewMessage
+	err := WalkSearchable(context.Background(), p, path, func(line SearchableLine) bool {
+		messages = append(messages, PreviewMessage{Role: line.Role, Text: line.Text, Timestamp: line.Timestamp})
+		return maxMessages <= 0 || len(messages) < maxMessages
+	})
+	return messages, err
 }
 
 // Enrich does a full transcript scan to extract tokens, model, tools and files.
@@ -130,12 +151,12 @@ func Enrich(p provider.Kind, path string) (*EnrichmentData, error) {
 	return EnrichClaudeSession(path)
 }
 
-// ReadSearchable extracts every conversation line for deep content search.
-func ReadSearchable(p provider.Kind, path string) ([]SearchableLine, error) {
+// WalkSearchable visits conversation text until EOF, cancellation, or visit stops.
+func WalkSearchable(ctx context.Context, p provider.Kind, path string, visit func(SearchableLine) bool) error {
 	if p == provider.Codex {
-		return ReadCodexText(path)
+		return WalkCodexText(ctx, path, visit)
 	}
-	return ReadClaudeText(path)
+	return WalkClaudeText(ctx, path, visit)
 }
 
 // Message represents a single JSONL line from a Claude session file.
@@ -152,7 +173,7 @@ type Message struct {
 // MessageContent holds the role + content from a Claude message.
 type MessageContent struct {
 	Role    string      `json:"role"`
-	Content interface{} `json:"content"` // string or []ContentBlock
+	Content interface{} `json:"content"` // string or []any containing decoded block objects
 	Model   string      `json:"model,omitempty"`
 	Usage   *Usage      `json:"usage,omitempty"`
 }
@@ -163,13 +184,6 @@ type Usage struct {
 	OutputTokens             int64 `json:"output_tokens"`
 	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
 	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
-}
-
-// ContentBlock is one element in a Claude assistant's content array.
-type ContentBlock struct {
-	Type string `json:"type"`
-	Text string `json:"text,omitempty"`
-	Name string `json:"name,omitempty"` // for tool_use blocks
 }
 
 // SessionsIndex is the structure of Claude's sessions-index.json files.

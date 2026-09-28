@@ -1,11 +1,14 @@
 package index
 
 import (
+	"context"
+	"fmt"
 	"runtime"
 	"strings"
 	"sync"
 	"unicode"
 
+	"github.com/LeonKohli/claude-sessions/internal/provider"
 	"github.com/LeonKohli/claude-sessions/internal/session"
 )
 
@@ -21,12 +24,13 @@ type SearchHit struct {
 //
 // maxSnippets and maxChars bound the result at the source rather than after
 // the fact: the caller is usually an agent paying for every returned byte.
-func SearchSessions(sessions []session.SessionEntry, query string, maxSnippets, maxChars int) []SearchHit {
+func SearchSessions(ctx context.Context, sessions []session.SessionEntry, query string, maxSnippets, maxChars int) ([]SearchHit, error) {
 	folded := foldQuery(query)
 	if len(folded) == 0 || len(sessions) == 0 {
-		return nil
+		return nil, ctx.Err()
 	}
 
+	reader := new(session.CodexReader)
 	jobs := make(chan session.SessionEntry, len(sessions))
 	for _, s := range sessions {
 		jobs <- s
@@ -34,13 +38,20 @@ func SearchSessions(sessions []session.SessionEntry, query string, maxSnippets, 
 	close(jobs)
 
 	results := make(chan SearchHit, len(sessions))
+	errors := make(chan error, len(sessions))
 	var wg sync.WaitGroup
 	for i := 0; i < runtime.NumCPU(); i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for s := range jobs {
-				if hit, ok := searchOne(s, folded, maxSnippets, maxChars); ok {
+				if ctx.Err() != nil {
+					return
+				}
+				hit, err := searchOne(ctx, reader, s, folded, maxSnippets, maxChars)
+				if err != nil {
+					errors <- fmt.Errorf("session %s: %w", s.SessionID, err)
+				} else if hit.Matches > 0 {
 					results <- hit
 				}
 			}
@@ -48,35 +59,44 @@ func SearchSessions(sessions []session.SessionEntry, query string, maxSnippets, 
 	}
 	wg.Wait()
 	close(results)
+	close(errors)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if count := len(errors); count > 0 {
+		return nil, fmt.Errorf("could not search %d sessions: %w", count, <-errors)
+	}
 
 	hits := make([]SearchHit, 0, len(results))
 	for h := range results {
 		hits = append(hits, h)
 	}
-	return hits
+	return hits, nil
 }
 
-func searchOne(s session.SessionEntry, query []rune, maxSnippets, maxChars int) (SearchHit, bool) {
-	lines, err := session.ReadSearchable(s.Provider, s.FullPath)
-	if err != nil {
-		return SearchHit{}, false
-	}
-
+func searchOne(ctx context.Context, reader *session.CodexReader, s session.SessionEntry, query []rune, maxSnippets, maxChars int) (SearchHit, error) {
 	hit := SearchHit{Session: s}
-	for _, line := range lines {
+	visit := func(line session.SearchableLine) bool {
 		idx := indexFold(line.Text, query)
 		if idx < 0 {
-			continue
+			return true
 		}
 		hit.Matches++
 		// Keep counting after the snippet budget is spent: the match count is
 		// what ranks a session, so it must reflect the whole transcript.
 		if maxSnippets > 0 && len(hit.Snippets) >= maxSnippets {
-			continue
+			return true
 		}
 		hit.Snippets = append(hit.Snippets, snippet(line.Role, line.Text, idx, len(query), maxChars))
+		return true
 	}
-	return hit, hit.Matches > 0
+	var err error
+	if s.Provider == provider.Codex {
+		err = reader.WalkText(ctx, s.FullPath, visit)
+	} else {
+		err = session.WalkSearchable(ctx, s.Provider, s.FullPath, visit)
+	}
+	return hit, err
 }
 
 // indexFold reports the rune index of the first case-insensitive match, or -1.
@@ -114,15 +134,19 @@ func snippet(role, text string, start, queryLen, maxChars int) string {
 	if maxChars <= 0 {
 		maxChars = 160
 	}
-	pad := maxChars / 2
-
+	prefix := "[" + role + "] "
+	budget := maxChars - len([]rune(prefix))
+	if budget < 1 {
+		prefix, budget = "", maxChars
+	}
+	pad := max(0, (budget-queryLen)/2)
 	runes := []rune(text)
-	from := max(0, start-pad)
-	to := min(len(runes), start+queryLen+pad)
+	from := max(0, min(start-pad, len(runes)-budget))
+	to := min(len(runes), from+budget)
 
 	out := strings.TrimSpace(string(runes[from:to]))
 	out = strings.Join(strings.Fields(out), " ")
-	return "[" + role + "] " + out
+	return prefix + out
 }
 
 // foldQuery lowercases a query rune-by-rune to match indexFold's comparison.
@@ -132,18 +156,4 @@ func foldQuery(query string) []rune {
 		runes[i] = unicode.ToLower(r)
 	}
 	return runes
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
