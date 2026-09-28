@@ -7,6 +7,7 @@
 package cli
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -46,6 +47,8 @@ type Fault struct {
 	Message string `json:"message"`
 	Hint    string `json:"hint,omitempty"`
 }
+
+func (f *Fault) Error() string { return f.Message }
 
 // Truncation describes output the limits cut off.
 //
@@ -123,19 +126,20 @@ func Emit(out *os.File, format Format, cmd string, r Result) error {
 			Data: r.Data, Truncated: r.Truncated,
 		})
 	default:
+		buffer := bufio.NewWriter(out)
 		if r.Text != nil {
-			r.Text(out)
+			r.Text(buffer)
 		}
 		// Truncation is a correctness signal, not decoration: a human reading
 		// text output must also know the list was cut short.
 		if t := r.Truncated; t != nil {
 			if t.Total > 0 {
-				fmt.Fprintf(out, "\n(%d of %d shown — %s)\n", t.Returned, t.Total, t.Hint)
+				fmt.Fprintf(buffer, "\n(%d of %d shown — %s)\n", t.Returned, t.Total, t.Hint)
 			} else {
-				fmt.Fprintf(out, "\n(%d shown — %s)\n", t.Returned, t.Hint)
+				fmt.Fprintf(buffer, "\n(%d shown — %s)\n", t.Returned, t.Hint)
 			}
 		}
-		return nil
+		return buffer.Flush()
 	}
 }
 

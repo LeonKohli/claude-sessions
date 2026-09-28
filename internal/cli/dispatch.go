@@ -1,18 +1,24 @@
 package cli
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strings"
+
+	"github.com/LeonKohli/claude-sessions/internal/index"
+	"github.com/LeonKohli/claude-sessions/internal/session"
 )
 
 // Commands lists the non-interactive surface, in the order `schema` reports it.
 var Commands = []CommandDoc{
 	{"list", "List sessions, newest first", "agent-sessions list --agent codex --limit 5"},
 	{"search", "Find sessions whose transcript contains a query", `agent-sessions search "auth middleware"`},
-	{"show", "Print a session's conversation", "agent-sessions show 019fa425 --limit 10"},
+	{"show", "Read conversation turns, optionally matching a literal query", "agent-sessions show 019fa425 experiments.md --limit 10"},
+	{"calls", "Find recorded tool inputs in a session (literal, case-insensitive query)", "agent-sessions calls 019fa425 pcap-dir --limit 5"},
 	{"files", "List files a session changed, and whether content is recoverable", "agent-sessions files 019fa425"},
 	{"cat", "Write one file's stored content from a session to stdout", "agent-sessions cat 019fa425 lib/links.ts"},
 	{"diff", "Print the unified diffs Codex recorded for a file", "agent-sessions diff 019fa425 lib/links.ts"},
@@ -41,7 +47,7 @@ func Run(args []string) (exit int, runTUI bool) {
 
 	cmd, rest := args[0], args[1:]
 	switch cmd {
-	case "list", "search", "show", "files", "cat", "diff", "resume", "schema":
+	case "list", "search", "show", "calls", "files", "cat", "diff", "resume", "schema":
 	case "-h", "--help", "help":
 		usage(os.Stdout)
 		return 0, false
@@ -57,7 +63,6 @@ func Run(args []string) (exit int, runTUI bool) {
 			cmd, rest = "list", args
 			break
 		}
-		usage(os.Stderr)
 		return Fail(FormatAuto, cmd, CodeUsage, fmt.Sprintf("unknown command %q", cmd),
 			"run `agent-sessions schema` to list commands"), false
 	}
@@ -82,32 +87,54 @@ func Run(args []string) (exit int, runTUI bool) {
 	claudeOnly := fs.Bool("claude", false, "shorthand for --agent claude")
 	codexOnly := fs.Bool("codex", false, "shorthand for --agent codex")
 
-	flagArgs, positional := splitArgs(normalizeArgs(rest))
+	named := make(map[string]string)
+	for _, name := range []string{"id", "query", "path"} {
+		fs.Func(name, "named "+name+" operand", func(value string) error {
+			if _, exists := named[name]; exists {
+				return fmt.Errorf("duplicate --%s", name)
+			}
+			named[name] = value
+			return nil
+		})
+	}
+	flagArgs, positional := splitArgs(fs, rest)
 	if err := fs.Parse(flagArgs); err != nil {
-		return Fail(FormatAuto, cmd, CodeUsage, err.Error(), knownFlagsHint()), false
+		if err == flag.ErrHelp {
+			usage(os.Stdout)
+			fs.SetOutput(os.Stdout)
+			fs.PrintDefaults()
+			return 0, false
+		}
+		format, formatErr := ParseFormat(*output)
+		if formatErr != nil {
+			format = FormatAuto
+		}
+		return Fail(format, cmd, CodeUsage, err.Error(), knownFlagsHint()), false
 	}
 
 	format, err := ParseFormat(*output)
 	if err != nil {
 		return Fail(FormatAuto, cmd, CodeUsage, err.Error(), ""), false
 	}
-
-	switch {
-	case *claudeOnly:
-		*agentFlag = "claude"
-	case *codexOnly:
-		*agentFlag = "codex"
+	if *limit < 0 || *limit == math.MaxInt || *maxChars < 0 || *snippets < 0 || *since < 0 {
+		return Fail(format, cmd, CodeUsage, "limits and durations must be nonnegative; --limit must be less than the maximum integer", ""), false
 	}
+
+	*agentFlag = ProviderFilter(*agentFlag, *claudeOnly, *codexOnly)
 	if *agentFlag != "" && *agentFlag != "claude" && *agentFlag != "codex" {
 		return Fail(format, cmd, CodeUsage,
 			fmt.Sprintf("invalid --agent %q", *agentFlag), "want claude or codex"), false
 	}
 
+	positional, err = commandOperands(cmd, positional, named)
+	if err != nil {
+		return Fail(format, cmd, CodeUsage, err.Error(), ""), false
+	}
 	f := Filter{
 		Provider: *agentFlag, Project: *project, Since: *since,
 		Subagents: *subagents, Limit: *limit,
 	}
-	res, err := execute(cmd, positional, &f, *snippets, *maxChars)
+	res, err := execute(cmd, positional, f, *snippets, *maxChars)
 	if err != nil {
 		return Fail(format, cmd, classify(err), err.Error(), hintFor(cmd, err)), false
 	}
@@ -117,7 +144,22 @@ func Run(args []string) (exit int, runTUI bool) {
 	return 0, false
 }
 
-func execute(cmd string, args []string, f *Filter, snippets, maxChars int) (Result, error) {
+func execute(cmd string, args []string, f Filter, snippets, maxChars int) (Result, error) {
+	var entry session.SessionEntry
+	switch cmd {
+	case "show", "calls", "files", "cat", "diff", "resume":
+		if len(args) == 0 {
+			return Result{}, &Fault{Code: CodeUsage, Message: fmt.Sprintf("%s needs a session id", cmd)}
+		}
+		if (cmd == "cat" || cmd == "diff") && len(args) < 2 {
+			return Result{}, &Fault{Code: CodeUsage, Message: fmt.Sprintf("%s needs a session id and a file path", cmd)}
+		}
+		var err error
+		entry, err = Resolve(args[0], f.Provider)
+		if err != nil {
+			return Result{}, err
+		}
+	}
 	switch cmd {
 	case "schema":
 		return schemaResult(), nil
@@ -126,70 +168,59 @@ func execute(cmd string, args []string, f *Filter, snippets, maxChars int) (Resu
 		if f.Limit == 0 {
 			f.Limit = DefaultListLimit
 		}
-		return List(*f)
+		return List(f)
 
 	case "search":
 		if len(args) == 0 {
-			return Result{}, fmt.Errorf("search needs a query")
+			return Result{}, &Fault{Code: CodeUsage, Message: fmt.Sprintf("search needs a query")}
 		}
 		if f.Limit == 0 {
 			f.Limit = DefaultSearchLimit
 		}
-		return Search(strings.Join(args, " "), *f, snippets, maxChars)
+		return Search(strings.Join(args, " "), f, snippets, maxChars)
 
 	case "show":
-		if len(args) == 0 {
-			return Result{}, fmt.Errorf("show needs a session id")
-		}
 		limit := f.Limit
 		if limit == 0 {
 			limit = DefaultShowMessages
 		}
-		return Show(args[0], limit, maxChars)
+		return Show(entry, strings.Join(args[1:], " "), limit, maxChars)
 
 	case "files":
-		if len(args) == 0 {
-			return Result{}, fmt.Errorf("files needs a session id")
+		return Files(entry)
+
+	case "calls":
+		if f.Limit == 0 {
+			f.Limit = DefaultSearchLimit
 		}
-		return Files(args[0])
+		return Calls(entry, strings.Join(args[1:], " "), f.Limit, maxChars)
 
 	case "cat":
-		if len(args) < 2 {
-			return Result{}, fmt.Errorf("cat needs a session id and a file path")
-		}
-		return Cat(args[0], args[1])
+		return Cat(entry, args[1])
 
 	case "diff":
-		if len(args) < 2 {
-			return Result{}, fmt.Errorf("diff needs a session id and a file path")
-		}
-		return Diff(args[0], args[1])
+		return Diff(entry, args[1])
 
 	case "resume":
-		if len(args) == 0 {
-			return Result{}, fmt.Errorf("resume needs a session id")
-		}
-		return Resume(args[0])
+		return Resume(entry)
 	}
-	return Result{}, fmt.Errorf("unknown command %q", cmd)
+	return Result{}, &Fault{Code: CodeUsage, Message: fmt.Sprintf("unknown command %q", cmd)}
 }
 
 // classify maps an error to a stable machine-readable code.
 func classify(err error) string {
-	msg := err.Error()
+	if errors.Is(err, index.ErrStoreUnavailable) || errors.Is(err, session.ErrHistoryUnavailable) {
+		return CodeUnavailable
+	}
+	var fault *Fault
+	if errors.As(err, &fault) {
+		return fault.Code
+	}
 	switch {
-	case strings.Contains(msg, "matches") && strings.Contains(msg, "use a longer id"):
-		return CodeAmbiguous
-	case strings.Contains(msg, "no session matches"),
-		strings.Contains(msg, "did not track"),
-		strings.Contains(msg, "did not patch"):
+	case errors.Is(err, session.ErrFileNotTracked):
 		return CodeNotFound
-	case strings.Contains(msg, "not recoverable"),
-		strings.Contains(msg, "no snapshot stored"),
-		strings.Contains(msg, "cannot be resumed"):
+	case errors.Is(err, session.ErrNotRecoverable), errors.Is(err, session.ErrDiffUnsupported):
 		return CodeUnrecoverable
-	case strings.Contains(msg, "needs a"), strings.Contains(msg, "empty query"):
-		return CodeUsage
 	default:
 		return CodeInternal
 	}
@@ -198,7 +229,7 @@ func classify(err error) string {
 func hintFor(cmd string, err error) string {
 	switch classify(err) {
 	case CodeAmbiguous:
-		return "pass more of the id, or use the full uuid from `agent-sessions list`"
+		return "use the full id from `agent-sessions list` or `search`, including any rollout suffix"
 	case CodeNotFound:
 		if cmd == "cat" || cmd == "diff" {
 			return "run `agent-sessions files <id>` to see the paths this session touched"
@@ -221,8 +252,27 @@ func schemaResult() Result {
 		"summary": "Search, read, and recover files from Claude Code and Codex session history.",
 		// Declares the piped default so a consumer reads the contract rather
 		// than inferring it, per CLI Spec principle 1.
-		"output":      map[string]string{"tty": "text", "piped": "json"},
-		"commands":    Commands,
+		"output":   map[string]string{"tty": "text", "piped": "json"},
+		"commands": Commands,
+		"response_fields": map[string][]string{
+			"list":   {"data.sessions", "data.count"},
+			"search": {"data.hits", "data.count", "data.query"},
+			"show":   {"data.session", "data.query", "data.turns"},
+			"calls":  {"data.session", "data.query", "data.calls", "data.count"},
+			"files":  {"data.session", "data.files", "data.count"},
+			"diff":   {"data.session", "data.path", "data.diffs"},
+			"resume": {"data.session", "data.cwd", "data.cwd_exists", "data.command"},
+		},
+		"raw_output_commands": []string{"cat"},
+		"named_operands":      map[string]string{"--id": "session id", "--query": "search or filter text", "--path": "file path"},
+		"provider_flags":      "A single --claude or --codex overrides --agent; both flags select both providers.",
+		"identity":            "Pass returned ids unchanged. Codex archive ids are thread-id/rollout-id; resume commands use the logical thread id.",
+		"provenance":          "Codex turns and calls include source (physical transcript path) and line. Referenced ancestors are bounded by their recorded cutoffs.",
+		"limits": map[string]string{
+			"truncated": "Omitted records, not shortened text. total is absent when not counted.",
+			"text":      "show marks text_truncated; calls marks input_truncated. Search snippets are previews.",
+			"zero":      "--limit 0 selects defaults; --max-chars 0 returns full show text or call input, but search snippets remain previews.",
+		},
 		"error_codes": []string{CodeUsage, CodeNotFound, CodeAmbiguous, CodeUnavailable, CodeUnrecoverable, CodeInternal},
 		"global_flags": []map[string]string{
 			{"flag": "--output", "values": "auto|json|text", "default": "auto"},
@@ -239,8 +289,8 @@ func schemaResult() Result {
 			{"name": "codex", "store": "~/.codex/sessions", "resume": "codex resume <id>"},
 		},
 		"recovery": map[string]string{
-			"claude": "snapshots under ~/.claude/file-history/<session>/ reproduce content byte-exactly",
-			"codex":  "adds and deletes store content verbatim; updates store only a unified diff",
+			"claude": "readable checkpoints or confirmed Write results; files reports recovery_source and recovery_earlier_version when newer checkpoints are unavailable",
+			"codex":  "adds and deletes are recoverable when content was recorded; updates store only a unified diff",
 		},
 	}
 	return Result{

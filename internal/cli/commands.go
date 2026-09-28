@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/LeonKohli/claude-sessions/internal/index"
 	"github.com/LeonKohli/claude-sessions/internal/provider"
@@ -42,7 +43,7 @@ type SessionRef struct {
 
 func toRef(e session.SessionEntry) SessionRef {
 	return SessionRef{
-		ID:        e.SessionID,
+		ID:        e.ReferenceID(),
 		Agent:     e.Provider.String(),
 		Title:     e.DisplayTitle(),
 		Project:   e.ProjectPath,
@@ -178,7 +179,7 @@ type Hit struct {
 // store costs more context than the answer is worth.
 func Search(query string, f Filter, snippets, maxChars int) (Result, error) {
 	if strings.TrimSpace(query) == "" {
-		return Result{}, fmt.Errorf("empty query")
+		return Result{}, &Fault{Code: CodeUsage, Message: "empty query"}
 	}
 	sessions, err := load(f)
 	if err != nil {
@@ -221,41 +222,51 @@ func Search(query string, f Filter, snippets, maxChars int) (Result, error) {
 
 // Turn is one conversation message.
 type Turn struct {
-	Role string `json:"role"`
-	At   string `json:"at"`
-	Text string `json:"text"`
+	Source        string `json:"source,omitempty"`
+	Role          string `json:"role"`
+	At            string `json:"at"`
+	Text          string `json:"text"`
+	Line          int    `json:"line,omitempty"`
+	TextTruncated bool   `json:"text_truncated,omitempty"`
 }
 
 // Show returns a session's conversation.
-func Show(id string, limit, maxChars int) (Result, error) {
-	e, err := Resolve(id)
-	if err != nil {
-		return Result{}, err
-	}
+func Show(e session.SessionEntry, query string, limit, maxChars int) (Result, error) {
 
-	msgs, err := session.ReadPreview(e.Provider, e.FullPath, limit+1)
-	if err != nil {
-		return Result{}, err
-	}
-
-	turns := make([]Turn, 0, len(msgs))
-	for _, m := range msgs {
+	query = strings.TrimSpace(query)
+	folded := strings.ToLower(query)
+	turns := make([]Turn, 0)
+	err := session.WalkSearchable(context.Background(), e.Provider, e.FullPath, func(m session.SearchableLine) bool {
+		if strings.TrimSpace(m.Text) == "" || !strings.Contains(strings.ToLower(m.Text), folded) {
+			return true
+		}
+		text, cut := textExcerpt(m.Text, folded, maxChars)
 		turns = append(turns, Turn{
-			Role: m.Role,
-			At:   m.Timestamp.UTC().Format(time.RFC3339),
-			Text: truncate(m.Text, maxChars),
+			Source:        m.Source,
+			Role:          m.Role,
+			At:            m.Timestamp.UTC().Format(time.RFC3339),
+			Text:          text,
+			Line:          m.LineNum,
+			TextTruncated: cut,
 		})
+		return len(turns) <= limit
+	})
+	if err != nil {
+		return Result{}, err
 	}
 	shown, trunc := boundLazy(turns, limit)
 
 	return Result{
-		Data:      map[string]any{"session": toRef(e), "turns": shown},
+		Data:      map[string]any{"session": toRef(e), "query": query, "turns": shown},
 		Truncated: trunc,
 		Text: func(w io.Writer) {
 			p := printer{w}
 			for _, t := range shown {
 				p.line("[%s] %s", t.Role, t.At)
 				p.line("%s", t.Text)
+				if t.TextTruncated {
+					p.line("(text excerpt; use --max-chars 0 for the full matching turn)")
+				}
 				p.blank()
 			}
 		},
@@ -265,11 +276,7 @@ func Show(id string, limit, maxChars int) (Result, error) {
 // ─────────────────────────────────────────── files
 
 // Files lists what a session changed on disk.
-func Files(id string) (Result, error) {
-	e, err := Resolve(id)
-	if err != nil {
-		return Result{}, err
-	}
+func Files(e session.SessionEntry) (Result, error) {
 	changes, err := session.FileChanges(e)
 	if err != nil {
 		return Result{}, err
@@ -285,6 +292,9 @@ func Files(id string) (Result, error) {
 					mark = "*"
 				}
 				p.line("%s %-7s rev%-3d %s", mark, c.Kind, c.Revisions, c.Path)
+				if c.RecoveryEarlierVersion {
+					p.line("  earlier version (%s): newer checkpoint unavailable", c.RecoverySource)
+				}
 			}
 			if len(changes) > 0 {
 				p.blank()
@@ -298,11 +308,7 @@ func Files(id string) (Result, error) {
 
 // Cat writes one file's stored content verbatim, with no envelope: the caller
 // asked for file bytes and should be able to redirect them straight to disk.
-func Cat(id, path string) (Result, error) {
-	e, err := Resolve(id)
-	if err != nil {
-		return Result{}, err
-	}
+func Cat(e session.SessionEntry, path string) (Result, error) {
 	content, err := session.RecoverContent(e, path)
 	if err != nil {
 		return Result{}, err
@@ -311,11 +317,7 @@ func Cat(id, path string) (Result, error) {
 }
 
 // Diff writes the unified diffs Codex recorded for a file.
-func Diff(id, path string) (Result, error) {
-	e, err := Resolve(id)
-	if err != nil {
-		return Result{}, err
-	}
+func Diff(e session.SessionEntry, path string) (Result, error) {
 	diffs, err := session.CodexDiff(e, path)
 	if err != nil {
 		return Result{}, err
@@ -336,13 +338,9 @@ func Diff(id, path string) (Result, error) {
 
 // Resume reports how to reopen a session. It prints rather than execs, because
 // an agent cannot hand its terminal to an interactive process.
-func Resume(id string) (Result, error) {
-	e, err := Resolve(id)
-	if err != nil {
-		return Result{}, err
-	}
+func Resume(e session.SessionEntry) (Result, error) {
 	if e.Provider == provider.Claude && e.IsSubagent {
-		return Result{}, fmt.Errorf("claude subagent transcripts cannot be resumed")
+		return Result{}, &Fault{Code: CodeUnrecoverable, Message: "claude subagent transcripts cannot be resumed"}
 	}
 	cmd := resumeCommand(e)
 
@@ -384,34 +382,37 @@ func shellQuote(value string) string {
 
 // ─────────────────────────────────────────── shared
 
-// Resolve finds a session by full or abbreviated id. Every listing shows an
-// 8-character prefix, so that is what callers will pass back.
-func Resolve(id string) (session.SessionEntry, error) {
+// Resolve accepts listed archive references and unambiguous session prefixes.
+func Resolve(id, agent string) (session.SessionEntry, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return session.SessionEntry{}, fmt.Errorf("no session id given")
+		return session.SessionEntry{}, &Fault{Code: CodeUsage, Message: "no session id given"}
 	}
-	all, err := index.Load(provider.All)
+	all, err := index.Load((Filter{Provider: agent}).kinds())
 	if err != nil {
 		return session.SessionEntry{}, err
 	}
 
-	var hits []session.SessionEntry
+	var exact, hits []session.SessionEntry
 	for _, e := range all {
-		if e.SessionID == id {
-			return e, nil // an exact id wins outright
+		ref := e.ReferenceID()
+		if ref == id || e.SessionID == id {
+			exact = append(exact, e)
 		}
-		if strings.HasPrefix(e.SessionID, id) {
+		if strings.HasPrefix(ref, id) || strings.HasPrefix(ref[strings.LastIndexByte(ref, '/')+1:], id) {
 			hits = append(hits, e)
 		}
 	}
+	if len(exact) > 0 {
+		hits = exact
+	}
 	switch len(hits) {
 	case 0:
-		return session.SessionEntry{}, fmt.Errorf("no session matches %q", id)
+		return session.SessionEntry{}, &Fault{Code: CodeNotFound, Message: fmt.Sprintf("no session matches %q", id)}
 	case 1:
 		return hits[0], nil
 	default:
-		return session.SessionEntry{}, fmt.Errorf("%q matches %d sessions, use a longer id", id, len(hits))
+		return session.SessionEntry{}, &Fault{Code: CodeAmbiguous, Message: fmt.Sprintf("%q matches %d sessions, use the full id from list or search", id, len(hits))}
 	}
 }
 
@@ -441,4 +442,18 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return string(r[:max]) + "…"
+}
+
+func textExcerpt(input, foldedQuery string, maxChars int) (string, bool) {
+	runes := []rune(input)
+	if maxChars <= 0 || len(runes) <= maxChars {
+		return input, false
+	}
+	start := 0
+	folded := strings.ToLower(input)
+	if offset := strings.Index(folded, foldedQuery); offset >= 0 {
+		start = max(0, utf8.RuneCountInString(folded[:offset])-maxChars/3)
+	}
+	end := min(len(runes), start+maxChars)
+	return string(runes[start:end]), true
 }

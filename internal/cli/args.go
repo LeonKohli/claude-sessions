@@ -1,22 +1,12 @@
 package cli
 
-import "strings"
+import (
+	"flag"
+	"slices"
+	"strings"
+)
 
-// boolFlags take no value, so a following token is a positional argument
-// rather than the flag's operand.
-var boolFlags = map[string]bool{
-	"subagents": true,
-	"claude":    true,
-	"codex":     true,
-	"help":      true,
-	"h":         true,
-}
-
-// flagAliases maps spellings a model is likely to produce onto the canonical
-// flag. Agents generalise from other tools in this space — `--json` is the
-// house style of cass, ctx and the codex session managers — and from the
-// snake_case of Python APIs. Rejecting those costs a whole turn to recover
-// from, so accepting them is cheaper than being right about spelling.
+// flagAliases maps alternate spellings to canonical flags and fixed values.
 var flagAliases = map[string]string{
 	"json":        "output=json",
 	"robot":       "output=json",
@@ -31,63 +21,54 @@ var flagAliases = map[string]string{
 	"tool":        "agent",
 	"cwd":         "project",
 	"workspace":   "project",
-}
-
-// positionalAliases name an operand that belongs in positional place.
-var positionalAliases = map[string]bool{
-	"query": true, "q": true, "text": true, "pattern": true,
-	"id": true, "session": true, "path": true, "file": true,
+	"q":           "query", "text": "query", "pattern": "query",
+	"session": "id", "file": "path",
 }
 
 // browserFlags are the only flags the interactive browser accepts. Every other
 // flag implies the caller wants the non-interactive surface.
 var browserFlags = map[string]bool{"claude": true, "codex": true}
 
-// normalizeArgs rewrites alias spellings and lifts named operands into
-// positional place, before the flag package ever sees them.
-func normalizeArgs(args []string) []string {
-	out := make([]string, 0, len(args))
+// splitArgs normalizes flags and separates interspersed operands in one pass.
+// Option values and operands after -- remain literal.
+func splitArgs(fs *flag.FlagSet, args []string) (flags, positional []string) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
-		if !strings.HasPrefix(a, "-") || a == "-" || a == "--" {
-			out = append(out, a)
+		if a == "--" {
+			positional = append(positional, args[i+1:]...)
+			return flags, positional
+		}
+		if !strings.HasPrefix(a, "-") || a == "-" {
+			positional = append(positional, a)
 			continue
 		}
 
-		name := strings.TrimLeft(a, "-")
-		value, hasValue := "", false
-		if j := strings.IndexByte(name, '='); j >= 0 {
-			name, value, hasValue = name[:j], name[j+1:], true
-		}
+		name, value, hasValue := strings.Cut(strings.TrimLeft(a, "-"), "=")
 
-		// --query "auth" is the same request as a bare operand.
-		if positionalAliases[name] {
-			if hasValue {
-				out = append(out, value)
-			} else if i+1 < len(args) {
-				i++
-				out = append(out, args[i])
+		if canonical, ok := flagAliases[name]; ok {
+			a = "--" + canonical
+			if strings.Contains(canonical, "=") {
+				hasValue = true
+			} else if hasValue {
+				a += "=" + value
 			}
+			name = canonical
+		}
+		flags = append(flags, a)
+		if hasValue || name == "h" || name == "help" {
 			continue
 		}
-
-		canonical, ok := flagAliases[name]
-		if !ok {
-			out = append(out, a)
-			continue
+		if registered := fs.Lookup(name); registered != nil {
+			if value, ok := registered.Value.(interface{ IsBoolFlag() bool }); ok && value.IsBoolFlag() {
+				continue
+			}
 		}
-		// An alias may carry its own value, as `--json` does.
-		if k := strings.IndexByte(canonical, '='); k >= 0 {
-			out = append(out, "--"+canonical)
-			continue
+		if i+1 < len(args) {
+			i++
+			flags = append(flags, args[i])
 		}
-		if hasValue {
-			out = append(out, "--"+canonical+"="+value)
-			continue
-		}
-		out = append(out, "--"+canonical)
 	}
-	return out
+	return flags, positional
 }
 
 // onlyBrowserFlags reports whether every argument is a flag the browser
@@ -106,41 +87,59 @@ func onlyBrowserFlags(args []string) bool {
 	return true
 }
 
-// splitArgs separates flags from positional arguments anywhere in the command
-// line.
-//
-// Go's flag package stops parsing at the first non-flag token, so
-// `search "auth" --limit 2` would fold the flags into the query. Agents write
-// flags after the operand at least as often as before it, and a query that
-// silently absorbs `--limit 2` returns zero results with no error — a failure
-// mode worth eliminating rather than documenting.
-func splitArgs(args []string) (flags, positional []string) {
-	for i := 0; i < len(args); i++ {
-		a := args[i]
+// ProviderFilter applies shorthand flags consistently in the CLI and browser.
+// Both flags select all providers; a single shorthand overrides --agent.
+func ProviderFilter(agent string, claudeOnly, codexOnly bool) string {
+	switch {
+	case claudeOnly && codexOnly:
+		return ""
+	case claudeOnly:
+		return "claude"
+	case codexOnly:
+		return "codex"
+	default:
+		return agent
+	}
+}
 
-		if a == "--" { // everything after is positional, by convention
-			positional = append(positional, args[i+1:]...)
-			return flags, positional
-		}
-
-		if !strings.HasPrefix(a, "-") || a == "-" {
-			positional = append(positional, a)
-			continue
-		}
-
-		flags = append(flags, a)
-		name := strings.TrimLeft(a, "-")
-		if idx := strings.IndexByte(name, '='); idx >= 0 {
-			continue // --flag=value carries its own operand
-		}
-		if boolFlags[name] {
-			continue
-		}
-		// A value flag consumes the next token, even if it looks positional.
-		if i+1 < len(args) {
-			i++
-			flags = append(flags, args[i])
+func commandOperands(command string, positional []string, named map[string]string) ([]string, error) {
+	if len(named) == 0 {
+		return positional, nil
+	}
+	var roles []string
+	switch command {
+	case "search":
+		roles = []string{"query"}
+	case "show", "calls":
+		roles = []string{"id", "query"}
+	case "cat", "diff":
+		roles = []string{"id", "path"}
+	case "files", "resume":
+		roles = []string{"id"}
+	}
+	for name := range named {
+		if !slices.Contains(roles, name) {
+			return nil, &Fault{Code: CodeUsage, Message: "--" + name + " is not an operand of " + command}
 		}
 	}
-	return flags, positional
+	var operands []string
+	for _, role := range roles {
+		if value, ok := named[role]; ok {
+			operands = append(operands, value)
+		} else if len(positional) > 0 {
+			if role == "query" {
+				operands = append(operands, strings.Join(positional, " "))
+				positional = nil
+			} else {
+				operands = append(operands, positional[0])
+				positional = positional[1:]
+			}
+		} else if role != "query" || command == "search" {
+			return nil, &Fault{Code: CodeUsage, Message: command + " needs a " + role}
+		}
+	}
+	if len(positional) > 0 {
+		return nil, &Fault{Code: CodeUsage, Message: "unexpected operands for " + command}
+	}
+	return operands, nil
 }

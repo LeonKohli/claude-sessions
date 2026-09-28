@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"flag"
 	"reflect"
 	"strings"
 	"testing"
@@ -10,6 +11,8 @@ import (
 // flag package stops at the first positional, which silently folded trailing
 // flags into the search query and returned zero hits with no error.
 func TestSplitArgs(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.Bool("subagents", false, "")
 	cases := []struct {
 		name       string
 		in         []string
@@ -67,7 +70,7 @@ func TestSplitArgs(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		flags, pos := splitArgs(c.in)
+		flags, pos := splitArgs(fs, c.in)
 		if !reflect.DeepEqual(flags, c.wantFlags) {
 			t.Errorf("%s: flags = %v, want %v", c.name, flags, c.wantFlags)
 		}
@@ -139,7 +142,8 @@ func TestShortIDPrefersTheAgentHalf(t *testing.T) {
 // Agents generalise flag spellings from other tools and from Python APIs.
 // A rejected spelling costs a whole turn to recover from, so the common
 // variants are normalised rather than refused.
-func TestNormalizeArgsAcceptsCommonAgentSpellings(t *testing.T) {
+func TestSplitArgsAcceptsCommonAgentSpellings(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	cases := []struct {
 		name string
 		in   []string
@@ -152,29 +156,30 @@ func TestNormalizeArgsAcceptsCommonAgentSpellings(t *testing.T) {
 		{"snake_case max chars", []string{"--max_chars", "80"}, []string{"--max-chars", "80"}},
 		{"provider alias", []string{"--provider", "codex"}, []string{"--agent", "codex"}},
 		{"equals form preserved", []string{"--max_results=5"}, []string{"--limit=5"}},
-		{"named query becomes positional", []string{"--query", "auth"}, []string{"auth"}},
-		{"named query with equals", []string{"--query=auth"}, []string{"auth"}},
-		{"named id becomes positional", []string{"--id", "abc123"}, []string{"abc123"}},
+		{"named query retains its role", []string{"--query", "auth"}, []string{"--query", "auth"}},
+		{"named query with equals", []string{"--query=auth"}, []string{"--query=auth"}},
+		{"named id retains its role", []string{"--id", "abc123"}, []string{"--id", "abc123"}},
 		{"canonical flags untouched", []string{"--limit", "5"}, []string{"--limit", "5"}},
 		{"unknown flag passes through to a real error", []string{"--bogus"}, []string{"--bogus"}},
 		{"bare operand untouched", []string{"auth error"}, []string{"auth error"}},
 	}
 	for _, c := range cases {
-		got := normalizeArgs(c.in)
+		flags, positional := splitArgs(fs, c.in)
+		got := append(flags, positional...)
 		if !reflect.DeepEqual(got, c.want) {
-			t.Errorf("%s: normalizeArgs(%v) = %v, want %v", c.name, c.in, got, c.want)
+			t.Errorf("%s: splitArgs(%v) = %v, want %v", c.name, c.in, got, c.want)
 		}
 	}
 }
 
-// A named operand must survive the normalise-then-split pipeline intact.
-func TestNormalizeThenSplitLiftsNamedOperands(t *testing.T) {
-	flags, pos := splitArgs(normalizeArgs([]string{"--query", "auth error", "--json", "--max_results", "3"}))
-	if len(pos) != 1 || pos[0] != "auth error" {
-		t.Errorf("positional = %v, want the query", pos)
+// Named operands keep their roles alongside flag aliases.
+func TestSplitArgsPreservesNamedOperandRoles(t *testing.T) {
+	flags, pos := splitArgs(flag.NewFlagSet("test", flag.ContinueOnError), []string{"--query", "auth error", "--json", "--max_results", "3"})
+	if len(pos) != 0 {
+		t.Errorf("positional = %v, want named query to remain a flag", pos)
 	}
 	joined := strings.Join(flags, " ")
-	for _, want := range []string{"--output=json", "--limit 3"} {
+	for _, want := range []string{"--query auth error", "--output=json", "--limit 3"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("flags %q missing %q", joined, want)
 		}
