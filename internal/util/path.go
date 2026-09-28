@@ -44,7 +44,7 @@ func DecodeProjectDirName(name string) string {
 // 1. originalPath from sessions-index.json (passed in)
 // 2. projectPath from session entry (passed in)
 // 3. cwd from first JSONL message (passed in)
-// 4. Filesystem probe via decoded dir name
+// 4. Decoded directory name when no recorded path is available
 func ResolveProjectPath(originalPath, entryProjectPath, jsonlCWD, dirName string) string {
 	if originalPath != "" {
 		return originalPath
@@ -55,11 +55,7 @@ func ResolveProjectPath(originalPath, entryProjectPath, jsonlCWD, dirName string
 	if jsonlCWD != "" {
 		return jsonlCWD
 	}
-	decoded := DecodeProjectDirName(dirName)
-	if _, err := os.Stat(decoded); err == nil {
-		return decoded
-	}
-	return decoded
+	return DecodeProjectDirName(dirName)
 }
 
 // Truncate truncates a string to maxLen, appending "…" if truncated.

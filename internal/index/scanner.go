@@ -19,6 +19,9 @@ func ScanClaude() ([]session.SessionEntry, error) {
 	projectsDir := provider.ClaudeProjectsDir()
 	entries, err := os.ReadDir(projectsDir)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
 		return nil, err
 	}
 
@@ -46,8 +49,11 @@ func ScanClaude() ([]session.SessionEntry, error) {
 		}
 
 		// Queue JSONL files the index does not cover for a parallel pass.
-		filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
-			if err != nil || info.IsDir() {
+		err := filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if info.IsDir() {
 				return nil
 			}
 			if !strings.HasSuffix(path, ".jsonl") || indexed[path] {
@@ -56,6 +62,9 @@ func ScanClaude() ([]session.SessionEntry, error) {
 			uncovered = append(uncovered, claudeScanJob{path: path, originalPath: originalPath, dirName: dirName})
 			return nil
 		})
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return append(allSessions, scanClaudeFiles(uncovered)...), nil
@@ -126,6 +135,9 @@ func parseSessionsIndex(path, dirName string) ([]session.SessionEntry, string, e
 		// Skip ghost entries — file must actually exist on disk
 		info, err := os.Stat(e.FullPath)
 		if err != nil {
+			continue
+		}
+		if info.ModTime().UnixMilli() != int64(e.FileMtime) {
 			continue
 		}
 
