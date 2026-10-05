@@ -90,28 +90,15 @@ func WalkClaudeText(ctx context.Context, path string, visit func(SearchableLine)
 			return err
 		}
 		lineNum++
-		if !mayContainJSONStrings(raw, "user", "assistant") {
-			continue
-		}
-
-		var msg Message
-		if err := json.Unmarshal(raw, &msg); err != nil {
-			continue
-		}
-
-		if (msg.Type != "user" && msg.Type != "assistant") || msg.Message == nil {
-			continue
-		}
-
-		text := ExtractText(msg.Message.Content)
-		if strings.TrimSpace(text) == "" {
+		role, text, ts, ok := claudeLineText(raw)
+		if !ok || strings.TrimSpace(text) == "" {
 			continue
 		}
 
 		if !visit(SearchableLine{
 			Text:      text,
-			Role:      msg.Message.Role,
-			Timestamp: msg.Timestamp,
+			Role:      role,
+			Timestamp: ts,
 			LineNum:   lineNum,
 		}) {
 			return nil
@@ -119,4 +106,84 @@ func WalkClaudeText(ctx context.Context, path string, visit func(SearchableLine)
 	}
 
 	return nil
+}
+
+// claudeLineText decodes only the fields a searchable message needs, so tool
+// results beside them are skipped rather than decoded.
+func claudeLineText(raw []byte) (role, text string, ts time.Time, ok bool) {
+	var kind, message, stamp []byte
+	if !eachMember(raw, func(key string, value []byte) bool {
+		switch key {
+		case "type":
+			kind = value
+		case "message":
+			message = value
+		case "timestamp":
+			stamp = value
+		}
+		return true
+	}) {
+		return "", "", time.Time{}, false
+	}
+	var typ string
+	if json.Unmarshal(kind, &typ) != nil || (typ != "user" && typ != "assistant") || message == nil || string(message) == "null" {
+		return "", "", time.Time{}, false
+	}
+	if stamp != nil && json.Unmarshal(stamp, &ts) != nil {
+		return "", "", time.Time{}, false
+	}
+	var roleValue, content []byte
+	if !eachMember(message, func(key string, value []byte) bool {
+		switch key {
+		case "role":
+			roleValue = value
+		case "content":
+			content = value
+		}
+		return true
+	}) {
+		return "", "", time.Time{}, false
+	}
+	if roleValue != nil && json.Unmarshal(roleValue, &role) != nil {
+		return "", "", time.Time{}, false
+	}
+	text, ok = contentText(content)
+	return role, text, ts, ok
+}
+
+// contentText mirrors ExtractText for undecoded message content.
+func contentText(content []byte) (string, bool) {
+	if len(content) == 0 {
+		return "", true
+	}
+	switch content[0] {
+	case '"':
+		var text string
+		err := json.Unmarshal(content, &text)
+		return text, err == nil
+	case '[':
+		var parts []string
+		ok := eachElement(content, func(block []byte) bool {
+			var kind, text []byte
+			if len(block) == 0 || block[0] != '{' {
+				return true
+			}
+			eachMember(block, func(key string, value []byte) bool {
+				switch key {
+				case "type":
+					kind = value
+				case "text":
+					text = value
+				}
+				return true
+			})
+			var typ, part string
+			if json.Unmarshal(kind, &typ) == nil && typ == "text" && json.Unmarshal(text, &part) == nil {
+				parts = append(parts, part)
+			}
+			return true
+		})
+		return strings.Join(parts, "\n"), ok
+	}
+	return "", true
 }

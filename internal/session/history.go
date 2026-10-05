@@ -110,13 +110,20 @@ func readHistorySegment(ctx context.Context, segment historySegment, yield func(
 		}
 		number++
 		if segment.end != nil {
-			var record struct {
-				Ordinal *uint64 `json:"ordinal"`
-			}
-			if json.Unmarshal(raw, &record) != nil || record.Ordinal == nil {
+			var value []byte
+			if !eachMember(raw, func(key string, member []byte) bool {
+				if key == "ordinal" {
+					value = member
+				}
+				return true
+			}) {
 				continue
 			}
-			if *record.Ordinal < segment.start || *record.Ordinal >= segment.end.Ordinal {
+			var ordinal *uint64
+			if json.Unmarshal(value, &ordinal) != nil || ordinal == nil {
+				continue
+			}
+			if *ordinal < segment.start || *ordinal >= segment.end.Ordinal {
 				continue
 			}
 		}

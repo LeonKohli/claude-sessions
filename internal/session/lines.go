@@ -22,9 +22,11 @@ func mayContainJSONStrings(raw []byte, values ...string) bool {
 }
 
 // readLines allows embedded tool output to exceed Scanner's token limit.
+// Transcripts reach hundreds of megabytes; the default 4 KiB buffer spends
+// most of a full scan in read system calls.
 func readLines(r io.Reader) iter.Seq2[[]byte, error] {
 	return func(yield func([]byte, error) bool) {
-		reader := bufio.NewReader(r)
+		reader := bufio.NewReaderSize(r, 1<<20)
 		for {
 			line, err := reader.ReadBytes('\n')
 			if len(line) > 0 && !yield(line, nil) {

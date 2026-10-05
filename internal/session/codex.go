@@ -276,20 +276,58 @@ func (r *CodexReader) WalkText(ctx context.Context, path string, visit func(Sear
 }
 
 func codexSearchLine(source historyLine, kind string) (SearchableLine, bool) {
-	if !mayContainJSONStrings(source.raw, kind) {
+	var envelope, payload, stamp []byte
+	if !eachMember(source.raw, func(key string, value []byte) bool {
+		switch key {
+		case "type":
+			envelope = value
+		case "payload":
+			payload = value
+		case "timestamp":
+			stamp = value
+		}
+		return true
+	}) {
 		return SearchableLine{}, false
 	}
-	var line codexLine
-	if json.Unmarshal(source.raw, &line) != nil || line.Type != kind {
+	var typ string
+	if json.Unmarshal(envelope, &typ) != nil || typ != kind {
+		return SearchableLine{}, false
+	}
+	var ts time.Time
+	if stamp != nil && json.Unmarshal(stamp, &ts) != nil {
+		return SearchableLine{}, false
+	}
+	// Tool calls, their output and reasoning share the envelope with
+	// conversation messages and dominate rollout size.
+	if !codexConversationPayload(payload, kind) {
 		return SearchableLine{}, false
 	}
 	var role, text string
 	if kind == "response_item" {
-		role, text = codexResponseText(line.Payload)
+		role, text = codexResponseText(payload)
 	} else {
-		role, text = codexEventText(line.Payload)
+		role, text = codexEventText(payload)
 	}
-	return SearchableLine{Text: text, Role: role, Timestamp: line.Timestamp, LineNum: source.number, Source: source.path}, role != "" && strings.TrimSpace(text) != ""
+	return SearchableLine{Text: text, Role: role, Timestamp: ts, LineNum: source.number, Source: source.path}, role != "" && strings.TrimSpace(text) != ""
+}
+
+func codexConversationPayload(payload []byte, kind string) bool {
+	var payloadType []byte
+	eachMember(payload, func(key string, value []byte) bool {
+		if key == "type" {
+			payloadType = value
+		}
+		return true
+	})
+	var typ string
+	if json.Unmarshal(payloadType, &typ) != nil {
+		return false
+	}
+	if kind == "response_item" {
+		return typ == "message"
+	}
+	return typ == "user_message" || typ == "agent_message"
 }
 
 // EnrichCodexSession does a full scan of a rollout to extract metrics.

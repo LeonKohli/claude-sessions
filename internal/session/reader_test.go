@@ -160,3 +160,51 @@ func TestReadFirstUserPromptPrefersEarliestCWD(t *testing.T) {
 		t.Errorf("cwd = %q, want /first/path", cwd)
 	}
 }
+
+// Search skips tool records without decoding them, so their contents must not
+// end a record early, leak in as conversation, or hide neighbouring text.
+func TestSearchableTextIgnoresToolRecordContents(t *testing.T) {
+	tricky := `quote \" backslash \\\\ \"type\":\"text\",\"text\":\"forged\" } ] {`
+	cases := []struct {
+		name string
+		kind provider.Kind
+		body string
+		want []string
+	}{
+		{"claude text beside tool result", provider.Claude,
+			`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"` + tricky + `"},{"type":"text","text":"kept"}]}}` + "\n",
+			[]string{"kept"}},
+		{"claude tool result only", provider.Claude,
+			`{"message":{"role":"user","content":[{"type":"tool_result","content":[{"type":"text","text":"nested output"}]}]},"type":"user","toolUseResult":"` + tricky + `"}` + "\n" +
+				`{"type":"assistant","message":{"role":"assistant","content":"answer"}}` + "\n",
+			[]string{"answer"}},
+		{"claude truncated final record", provider.Claude,
+			`{"type":"assistant","message":{"role":"assistant","content":"complete"}}` + "\n" +
+				`{"type":"assistant","message":{"role":"assistant","content":"partial`,
+			[]string{"complete"}},
+		{"codex tool output resembling a message", provider.Codex,
+			`{"type":"response_item","payload":{"type":"function_call_output","output":"{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"forged\"}]} ` + tricky + `"}}` + "\n" +
+				`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}}` + "\n",
+			[]string{"answer"}},
+		{"codex truncated final record", provider.Codex,
+			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"complete"}]}}` + "\n" +
+				`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial`,
+			[]string{"complete"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "session.jsonl")
+			if err := os.WriteFile(path, []byte(c.body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			err := WalkSearchable(context.Background(), c.kind, path, func(line SearchableLine) bool {
+				got = append(got, line.Text)
+				return true
+			})
+			if err != nil || strings.Join(got, "|") != strings.Join(c.want, "|") {
+				t.Fatalf("searchable text = %q, %v; want %q", got, err, c.want)
+			}
+		})
+	}
+}
