@@ -12,8 +12,7 @@ const (
 	deepSearchChars    = 120
 )
 
-// deepSearch greps every transcript for the query. It shares the CLI's search
-// core so the browser and the agent-facing `search` command cannot drift.
+// deepSearch shares the CLI's indexed conversation search.
 func deepSearch(ctx context.Context, sessions []session.SessionEntry, query string) ([]DeepMatch, error) {
 	hits, err := index.SearchSessions(ctx, sessions, query, deepSearchSnippets, deepSearchChars)
 	if err != nil {

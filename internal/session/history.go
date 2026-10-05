@@ -27,6 +27,19 @@ type CodexReader struct {
 
 var ErrHistoryUnavailable = errors.New("Codex history unavailable")
 
+// HistoryFiles identifies the physical files contributing to a logical rollout.
+func (r *CodexReader) HistoryFiles(ctx context.Context, path string) ([]string, error) {
+	segments, err := r.history(ctx, path)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrHistoryUnavailable, err)
+	}
+	paths := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		paths = append(paths, segment.path)
+	}
+	return paths, nil
+}
+
 type historyPosition struct {
 	ThreadID string `json:"thread_id"`
 	Ordinal  uint64 `json:"end_ordinal_exclusive"`

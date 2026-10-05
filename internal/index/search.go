@@ -3,12 +3,9 @@ package index
 import (
 	"context"
 	"fmt"
-	"runtime"
 	"strings"
-	"sync"
-	"unicode"
+	"unicode/utf8"
 
-	"github.com/LeonKohli/claude-sessions/internal/provider"
 	"github.com/LeonKohli/claude-sessions/internal/session"
 )
 
@@ -19,8 +16,7 @@ type SearchHit struct {
 	Snippets []string
 }
 
-// SearchSessions greps every transcript in parallel and returns the sessions
-// that matched, each with a bounded number of context snippets.
+// SearchSessions updates changed transcripts and searches their persisted text.
 //
 // maxSnippets and maxChars bound the result at the source rather than after
 // the fact: the caller is usually an agent paying for every returned byte.
@@ -29,104 +25,97 @@ func SearchSessions(ctx context.Context, sessions []session.SessionEntry, query 
 	if len(folded) == 0 || len(sessions) == 0 {
 		return nil, ctx.Err()
 	}
-
-	reader := new(session.CodexReader)
-	jobs := make(chan session.SessionEntry, len(sessions))
-	for _, s := range sessions {
-		jobs <- s
-	}
-	close(jobs)
-
-	results := make(chan SearchHit, len(sessions))
-	errors := make(chan error, len(sessions))
-	var wg sync.WaitGroup
-	for i := 0; i < runtime.NumCPU(); i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for s := range jobs {
-				if ctx.Err() != nil {
-					return
-				}
-				hit, err := searchOne(ctx, reader, s, folded, maxSnippets, maxChars)
-				if err != nil {
-					errors <- fmt.Errorf("session %s: %w", s.SessionID, err)
-				} else if hit.Matches > 0 {
-					results <- hit
-				}
-			}
-		}()
-	}
-	wg.Wait()
-	close(results)
-	close(errors)
-	if err := ctx.Err(); err != nil {
+	lock, err := acquireWork(ctx)
+	if err != nil {
 		return nil, err
 	}
-	if count := len(errors); count > 0 {
-		return nil, fmt.Errorf("could not search %d sessions: %w", count, <-errors)
-	}
+	defer lock.Close()
 
-	hits := make([]SearchHit, 0, len(results))
-	for h := range results {
-		hits = append(hits, h)
+	db, err := openIndex(ctx)
+	if err != nil {
+		return nil, err
 	}
-	return hits, nil
-}
-
-func searchOne(ctx context.Context, reader *session.CodexReader, s session.SessionEntry, query []rune, maxSnippets, maxChars int) (SearchHit, error) {
-	hit := SearchHit{Session: s}
-	visit := func(line session.SearchableLine) bool {
-		idx := indexFold(line.Text, query)
-		if idx < 0 {
-			return true
+	defer db.Close()
+	signatures, err := loadSignatures(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	reader := new(session.CodexReader)
+	for _, s := range sessions {
+		if err := indexTranscript(ctx, db, reader, s, signatures[transcriptKey(s.Provider, s.FullPath)]); err != nil {
+			return nil, fmt.Errorf("session %s: %w", s.SessionID, err)
 		}
-		hit.Matches++
-		// Keep counting after the snippet budget is spent: the match count is
-		// what ranks a session, so it must reflect the whole transcript.
-		if maxSnippets > 0 && len(hit.Snippets) >= maxSnippets {
-			return true
+	}
+	if err := wantSessions(ctx, db, sessions); err != nil {
+		return nil, err
+	}
+	queryLen := utf8.RuneCountInString(folded)
+	// BLOB matching preserves literal bytes, including NUL, after FTS selection.
+	statement := `INSERT INTO matches SELECT m.id, m.transcript
+FROM search_messages m JOIN wanted w ON w.key = m.transcript
+WHERE instr(CAST(m.folded AS BLOB), CAST(? AS BLOB)) > 0`
+	arguments := []any{folded}
+	if queryLen >= 3 && !strings.ContainsRune(folded, 0) {
+		statement = `INSERT INTO matches SELECT m.id, m.transcript
+FROM search_text JOIN search_messages m ON m.id = search_text.rowid
+JOIN wanted w ON w.key = m.transcript
+WHERE search_text MATCH ? AND instr(CAST(m.folded AS BLOB), CAST(? AS BLOB)) > 0`
+		arguments = []any{`"` + strings.ReplaceAll(folded, `"`, `""`) + `"`, folded}
+	}
+	if _, err := db.ExecContext(ctx, statement, arguments...); err != nil {
+		return nil, err
+	}
+	rows, err := db.QueryContext(ctx, "SELECT transcript, count(*) FROM matches GROUP BY transcript")
+	if err != nil {
+		return nil, err
+	}
+	byKey := make(map[string]*SearchHit)
+	for rows.Next() {
+		var key string
+		hit := new(SearchHit)
+		if err := rows.Scan(&key, &hit.Matches); err != nil {
+			rows.Close()
+			return nil, err
 		}
-		hit.Snippets = append(hit.Snippets, snippet(line.Role, line.Text, idx, len(query), maxChars))
-		return true
+		byKey[key] = hit
 	}
-	var err error
-	if s.Provider == provider.Codex {
-		err = reader.WalkText(ctx, s.FullPath, visit)
-	} else {
-		err = session.WalkSearchable(ctx, s.Provider, s.FullPath, visit)
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
 	}
-	return hit, err
-}
-
-// indexFold reports the rune index of the first case-insensitive match, or -1.
-//
-// It deliberately avoids strings.Index over a lowercased copy: case folding
-// changes UTF-8 byte length in both directions (İ shrinks, Ⱥ grows), so a byte
-// offset taken from the folded text does not address the original. Applying one
-// to the other silently mis-centres the snippet, and panics outright when the
-// folded text is longer. Folding rune-by-rune is 1:1, so indices stay aligned.
-func indexFold(text string, query []rune) int {
-	if len(query) == 0 {
-		return -1
-	}
-	runes := []rune(text)
-	if len(runes) < len(query) {
-		return -1
-	}
-	for i := 0; i <= len(runes)-len(query); i++ {
-		matched := true
-		for j, q := range query {
-			if unicode.ToLower(runes[i+j]) != q {
-				matched = false
-				break
+	if maxSnippets > 0 {
+		for key, hit := range byKey {
+			rows, err := db.QueryContext(ctx, `SELECT m.role, m.text FROM matches matched
+JOIN search_messages m ON m.id = matched.id WHERE matched.transcript = ?
+ORDER BY m.ordinal LIMIT ?`, key, maxSnippets)
+			if err != nil {
+				return nil, err
+			}
+			for rows.Next() {
+				var role, text string
+				if err := rows.Scan(&role, &text); err != nil {
+					rows.Close()
+					return nil, err
+				}
+				normalized := strings.ToLower(text)
+				offset := strings.Index(normalized, folded)
+				hit.Snippets = append(hit.Snippets, snippet(role, text, utf8.RuneCountInString(normalized[:offset]), queryLen, maxChars))
+			}
+			err = rows.Err()
+			rows.Close()
+			if err != nil {
+				return nil, err
 			}
 		}
-		if matched {
-			return i
+	}
+	var hits []SearchHit
+	for _, s := range sessions {
+		if hit := byKey[transcriptKey(s.Provider, s.FullPath)]; hit != nil {
+			hits = append(hits, SearchHit{Session: s, Matches: hit.Matches, Snippets: hit.Snippets})
 		}
 	}
-	return -1
+	return hits, nil
 }
 
 // snippet extracts readable context centred on a match, addressed in runes.
@@ -149,11 +138,6 @@ func snippet(role, text string, start, queryLen, maxChars int) string {
 	return prefix + out
 }
 
-// foldQuery lowercases a query rune-by-rune to match indexFold's comparison.
-func foldQuery(query string) []rune {
-	runes := []rune(strings.TrimSpace(query))
-	for i, r := range runes {
-		runes[i] = unicode.ToLower(r)
-	}
-	return runes
+func foldQuery(query string) string {
+	return strings.ToLower(strings.TrimSpace(query))
 }

@@ -22,7 +22,7 @@ func TestCodexDiscoveryUsesDatabaseSelectionOrFilesystemFallback(t *testing.T) {
 			if err := os.WriteFile(unindexed, []byte(body), 0600); err != nil {
 				t.Fatal(err)
 			}
-			entries, err := ScanCodex()
+			entries, err := scanCodex(testIndex(t))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -66,7 +66,7 @@ func TestCodexIDFromFilename(t *testing.T) {
 // falling back to the rollout files.
 func TestCodexScanFallsBackWithoutStateDB(t *testing.T) {
 	setupCodexDiscoveryStore(t, false)
-	real, err := scanCodexRollouts()
+	real, err := scanCodexRollouts(testIndex(t))
 	if err != nil || len(real) == 0 {
 		t.Fatalf("fixture rollouts were not discovered: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestCodexScanFallsBackWithoutStateDB(t *testing.T) {
 		t.Fatalf("fixture home unexpectedly has a state database: %s", db)
 	}
 
-	entries, err := ScanCodex()
+	entries, err := scanCodex(testIndex(t))
 	if err != nil {
 		t.Fatalf("ScanCodex without a state db: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestCodexScanFallsBackWithoutStateDB(t *testing.T) {
 // session must still have a readable transcript.
 func TestCodexEntriesResolveOnDisk(t *testing.T) {
 	setupCodexDiscoveryStore(t, true)
-	entries, err := ScanCodex()
+	entries, err := scanCodex(testIndex(t))
 	if err != nil {
 		t.Fatalf("fixture store scan: %v", err)
 	}
@@ -183,4 +183,36 @@ func setupCodexDiscoveryStore(t *testing.T, database bool) {
 			t.Fatal(err)
 		}
 	}
+}
+
+func TestLoadSeesCodexDatabaseChangesWithoutTranscriptChanges(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(root, "cache"))
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(root, "claude"))
+	setupCodexDiscoveryStore(t, true)
+	if got, err := Load([]provider.Kind{provider.Codex}); err != nil || len(got) != 2 {
+		t.Fatalf("initial discovery = %+v, %v", got, err)
+	}
+	db, err := sql.Open("sqlite", (&url.URL{Scheme: "file", Path: provider.CodexStateDB()}).String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("UPDATE threads SET cwd = ?, updated_at = ? WHERE id = ?", "/moved/project", 42, "main"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load([]provider.Kind{provider.Codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range got {
+		if entry.SessionID == "main" {
+			if entry.ProjectPath != "/moved/project" || entry.Modified.Unix() != 42 || entry.FirstPrompt != "prompt main" {
+				t.Fatalf("database metadata lost: %+v", entry)
+			}
+			return
+		}
+	}
+	t.Fatalf("updated thread missing: %+v", got)
 }

@@ -81,7 +81,7 @@ func Run(args []string) (exit int, runTUI bool) {
 		subagents = fs.Bool("subagents", false, "include spawned subagent threads")
 		limit     = fs.Int("limit", 0, "maximum results (0 uses the per-command default)")
 		maxChars  = fs.Int("max-chars", DefaultMaxChars, "truncate each text field to this many characters")
-		snippets  = fs.Int("snippets", DefaultSnippets, "context snippets per matching session")
+		snippets  = fs.Int("snippets", DefaultSnippets, "context snippets per matching session (0 omits snippets)")
 	)
 	// Accept the TUI's spellings so one habit works across both surfaces.
 	claudeOnly := fs.Bool("claude", false, "shorthand for --agent claude")
@@ -209,7 +209,7 @@ func execute(cmd string, args []string, f Filter, snippets, maxChars int) (Resul
 
 // classify maps an error to a stable machine-readable code.
 func classify(err error) string {
-	if errors.Is(err, index.ErrStoreUnavailable) || errors.Is(err, session.ErrHistoryUnavailable) {
+	if errors.Is(err, index.ErrStoreUnavailable) || errors.Is(err, index.ErrIndexBusy) || errors.Is(err, session.ErrHistoryUnavailable) {
 		return CodeUnavailable
 	}
 	var fault *Fault
@@ -227,6 +227,9 @@ func classify(err error) string {
 }
 
 func hintFor(cmd string, err error) string {
+	if errors.Is(err, index.ErrIndexBusy) {
+		return "wait for the other agent-sessions operation to finish, then retry"
+	}
 	switch classify(err) {
 	case CodeAmbiguous:
 		return "use the full id from `agent-sessions list` or `search`, including any rollout suffix"
@@ -271,7 +274,7 @@ func schemaResult() Result {
 		"limits": map[string]string{
 			"truncated": "Omitted records, not shortened text. total is absent when not counted.",
 			"text":      "show marks text_truncated; calls marks input_truncated. Search snippets are previews.",
-			"zero":      "--limit 0 selects defaults; --max-chars 0 returns full show text or call input, but search snippets remain previews.",
+			"zero":      "--limit 0 selects defaults; --snippets 0 omits snippets; --max-chars 0 returns full show text or call input, but search snippets remain previews.",
 		},
 		"error_codes": []string{CodeUsage, CodeNotFound, CodeAmbiguous, CodeUnavailable, CodeUnrecoverable, CodeInternal},
 		"global_flags": []map[string]string{

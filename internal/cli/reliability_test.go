@@ -30,6 +30,8 @@ func TestEmptySessionIDReportsUsageError(t *testing.T) {
 
 func TestSelectedProviderCommandsIgnoreBrokenOtherStore(t *testing.T) {
 	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(root, "cache"))
 	t.Setenv("CODEX_HOME", root)
 	t.Setenv("CODEX_SQLITE_HOME", root)
 	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(root, "claude"))
@@ -62,6 +64,8 @@ func TestSelectedProviderCommandsIgnoreBrokenOtherStore(t *testing.T) {
 
 func TestShowFullTextPreservesWhitespace(t *testing.T) {
 	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(root, "cache"))
 	t.Setenv("CLAUDE_CONFIG_DIR", root)
 	t.Setenv("CODEX_HOME", filepath.Join(root, "codex"))
 	t.Setenv("CODEX_SQLITE_HOME", filepath.Join(root, "codex"))

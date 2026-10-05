@@ -17,15 +17,6 @@ func CacheDir() (string, error) {
 	return filepath.Join(base, "agent-sessions"), nil
 }
 
-// CachePath returns the full path to the gob cache file.
-func CachePath() (string, error) {
-	dir, err := CacheDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "index.gob"), nil
-}
-
 // DecodeProjectDirName decodes a Claude projects directory name.
 // The encoding is: leading "/" becomes "-", then all "/" become "-".
 // But this is ambiguous ("my-project" vs "my/project"), so we only

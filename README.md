@@ -82,19 +82,13 @@ agent-sessions calls <id> pcap-dir --json --limit 5 |
 
 To inspect a complete input, query its call ID with `--max-chars 0`. For a Claude `Bash` call, the complete `input` can then be decoded with `jq -r '.data.calls[].input | fromjson | .command'`. Custom tool inputs may be plain text instead of JSON. jq sees only returned records, so downstream filtering cannot find calls omitted by `--limit`. Keep JSON intact; use native limits and jq projections instead of `head -c`.
 
-Search reports a failure if an indexed transcript cannot be read. It does not present an incomplete search as zero matches. Malformed JSON records are skipped so an unfinished final line does not prevent reading an active session.
+Search fails if a selected transcript is missing or cannot be refreshed. Unchanged transcripts use persisted search text. Malformed JSON records are skipped so an unfinished final line does not prevent reading an active session.
+
+`--snippets 0` omits snippets while preserving match counts and ranking. `--limit` bounds returned sessions, not the amount of transcript text searched.
 
 ### Why structured output rather than grep
 
-Measured on this machine's store (3,961 sessions, ~3 GB), searching the term `error`:
-
-| | Raw `rg` over the stores | `agent-sessions search --limit 5` |
-|---|---|---|
-| Wall clock | **did not finish in 120 s** | 4.2 s |
-| Returned | unbounded | 3.4 KB (~855 tokens) |
-| Coverage | unknown | `5 of 848`, declared |
-
-Bounded output is not politeness. An unbounded result is one an agent cannot afford to read, which makes the history effectively unavailable.
+Search returns ranked sessions and bounded snippets. Its envelope reports omitted sessions, so callers can distinguish a complete result from a limited preview without reading every matching line.
 
 ### Argument handling
 
@@ -120,7 +114,7 @@ Where this tool differs:
 - **Codex's own thread index.** Discovery reads `state_<n>.sqlite` — the database `codex resume` itself trusts — so titles, archived state and token totals match what Codex reports. Other tools read the rollout JSONL only.
 - **Scope.** Two agents, no embeddings, no daemon, no model downloads.
 
-The honest gap is search cost. This greps every transcript per query at ~500 MB/s: **~4 s over 3 GB, ~12 s over 6 GB with subagents.** A prebuilt inverted index answers in milliseconds. That is fine for occasional recall and wrong for a tight loop — if you start calling `search` repeatedly, use cass.
+Search uses a persistent SQLite FTS5 trigram index. The first search parses the selected transcripts; later searches refresh only changed files. Literal queries keep punctuation and use Go's Unicode lowercasing. FTS candidates receive an exact byte-substring check on the normalized text. Queries shorter than three Unicode characters or containing NUL scan stored text instead of parsing the archives again.
 
 ### For humans
 
@@ -205,11 +199,13 @@ Listings show a 12-character prefix, not the conventional 8. Codex ids are UUIDv
 
 ### Caching
 
-The gob index uses [Go's user cache directory](https://pkg.go.dev/os#UserCacheDir): `~/Library/Caches/agent-sessions/index.gob` on macOS and `$XDG_CACHE_HOME/agent-sessions/index.gob` on Linux, defaulting to `~/.cache`. It is versioned and fingerprinted with its transcript stores and state database. Changing `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, or `CODEX_SQLITE_HOME` prevents reuse of another store's index. Transcript sizes and modification times invalidate stale metadata even when a session is appended without changing its parent directory. Cache files are private to the user.
+The SQLite index uses [Go's user cache directory](https://pkg.go.dev/os#UserCacheDir): `~/Library/Caches/agent-sessions/index.sqlite` on macOS and `$XDG_CACHE_HOME/agent-sessions/index.sqlite` on Linux, defaulting to `~/.cache`. It stores rebuildable transcript metadata and search text, including physical source paths and line numbers. The database file is created with mode `0600`.
 
-The write is synchronous. Doing it in a background goroutine works fine for the browser and never completes for anything else: a subcommand exits before the goroutine runs, so every invocation re-scanned the whole store and left an orphaned `.tmp` behind. Encoding costs ~30 ms against a ~2 s scan.
+Discovery checks a fingerprint of the current file inventory and Codex thread database on each load. An unchanged fingerprint reuses the saved session list. When it changes, discovery rereads Claude session indexes and the Codex thread database, while reusing raw metadata by physical path and file signature. Search refreshes changed transcripts in transactions, using file sizes and nanosecond modification times. It rereads changed transcripts but updates the full-text index only for new, changed, or removed conversation messages. Codex signatures include every referenced ancestor, and history resolution still rejects missing or ambiguous sources. Deleted or undiscovered sessions are removed from the index after successful discovery.
 
-**Cold ~2 s for ~4,000 sessions across both agents; warm ~40 ms.**
+Metadata loads and transcript searches share an OS file lock in this writable directory. One operation runs at a time across processes sharing the cache; waiting processes reuse completed updates. Lock acquisition waits at most five seconds, then fails with `store_unavailable` and a retry hint. Closing the descriptor or exiting releases the lock, and browser searches can be cancelled while waiting or indexing. The executable limits Go execution to two CPUs, or fewer when `GOMAXPROCS` requests fewer. Metadata scan pools use at most two workers each.
+
+Indexing runs synchronously and requires additional disk space. It does not start a daemon or watcher. You can rebuild the cache by removing `index.sqlite` while no operation is running. The earlier `index.gob` cache is no longer used.
 
 ## Architecture
 
@@ -230,8 +226,10 @@ internal/
   index/
     scanner.go                   # Claude store walk (parallel)
     codex.go                     # SQLite fast path + rollout fallback
-    search.go                    # parallel transcript grep, shared by CLI and TUI
-    cache.go / index.go          # gob cache, concurrent load
+    search.go                    # indexed literal search, shared by CLI and TUI
+    database.go                  # SQLite metadata, transcript text, FTS5 index
+    cache.go / index.go          # listing fingerprint and current discovery
+    workload.go                  # process-wide admission lock
   tui/                           # browser
   util/                          # paths, formatting, clipboard
 ```

@@ -1,11 +1,11 @@
 package index
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
 	"sync"
-	"time"
 
 	"github.com/LeonKohli/claude-sessions/internal/provider"
 	"github.com/LeonKohli/claude-sessions/internal/session"
@@ -13,15 +13,35 @@ import (
 
 var ErrStoreUnavailable = errors.New("session store unavailable")
 
-// Load returns sessions from every requested provider, using the cache when
-// valid and falling back to a full scan. A provider that is not installed
-// contributes nothing rather than failing the load.
+// Load discovers current sessions and reuses unchanged transcript metadata.
+// A provider that is not installed contributes nothing.
 func Load(kinds []provider.Kind) ([]session.SessionEntry, error) {
-	if cache := LoadCache(); IsCacheValid(cache) {
-		return filterKinds(cache.Sessions, kinds), nil
+	lock, err := acquireWork(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	defer lock.Close()
+	db, err := openIndex(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	signature, signatureErr := listingSignature()
+	if signatureErr == nil {
+		if entries, ok := loadListing(db, signature); ok {
+			return filterKinds(entries, kinds), nil
+		}
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	cache, err := loadMetadata(tx)
+	if err != nil {
+		return nil, err
 	}
 
-	scannedAt := time.Now()
 	var (
 		mu         sync.Mutex
 		all        []session.SessionEntry
@@ -40,8 +60,8 @@ func Load(kinds []provider.Kind) ([]session.SessionEntry, error) {
 	}
 
 	wg.Add(2)
-	go scan(provider.Claude, ScanClaude)
-	go scan(provider.Codex, ScanCodex)
+	go scan(provider.Claude, func() ([]session.SessionEntry, error) { return scanClaude(cache) })
+	go scan(provider.Codex, func() ([]session.SessionEntry, error) { return scanCodex(cache) })
 	wg.Wait()
 	if len(kinds) == 0 {
 		kinds = provider.All
@@ -55,16 +75,20 @@ func Load(kinds []provider.Kind) ([]session.SessionEntry, error) {
 	sort.Slice(all, func(i, j int) bool {
 		return all[i].Modified.After(all[j].Modified)
 	})
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
 
-	// Write the cache before returning. A background save is lost whenever the
-	// process is short-lived, which is every non-interactive invocation: each
-	// one would re-scan the whole store and leave an orphaned .tmp behind.
-	// Encoding costs ~30ms against a ~2s scan, so it is not worth deferring.
-	//
-	// The full index is cached regardless of the requested filter, so a later
-	// run with different flags still hits warm.
 	if len(scanErrors) == 0 {
-		_ = SaveCache(all, scannedAt)
+		if err := wantSessions(context.Background(), db, all); err != nil {
+			return nil, err
+		}
+		if err := pruneIndex(db); err != nil {
+			return nil, err
+		}
+		if after, err := listingSignature(); signatureErr == nil && err == nil && after == signature {
+			saveListing(db, signature, all)
+		}
 	}
 
 	return filterKinds(all, kinds), nil

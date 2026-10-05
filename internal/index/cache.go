@@ -1,170 +1,83 @@
 package index
 
 import (
-	"encoding/gob"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/json"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
-	"time"
+	"strings"
 
 	"github.com/LeonKohli/claude-sessions/internal/provider"
 	"github.com/LeonKohli/claude-sessions/internal/session"
-	"github.com/LeonKohli/claude-sessions/internal/util"
 )
 
-// cacheVersion invalidates metadata derived by older readers.
-const cacheVersion = 8
+const listingVersion = 1
 
-// CachedIndex holds the cached session data + metadata for invalidation.
-type CachedIndex struct {
-	Version   int
-	ScannedAt time.Time
-	// Stores this index was built from. CLAUDE_CONFIG_DIR and CODEX_HOME can
-	// repoint the scan at a different set of transcripts while the cache stays
-	// at one fixed path, so it must not be reused across such a change.
-	Stores   []string
-	Sessions []session.SessionEntry
-}
-
-// storeFingerprint identifies which transcript stores an index covers.
-func storeFingerprint() []string {
-	return []string{provider.ClaudeProjectsDir(), provider.CodexSessionsDir(), provider.CodexStateDB()}
-}
-
-func sameStores(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// LoadCache reads the gob cache from disk. Returns nil if the cache is absent,
-// corrupt, or written by an older layout.
-func LoadCache() *CachedIndex {
-	path, err := util.CachePath()
-	if err != nil {
-		return nil
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-
-	var ci CachedIndex
-	if err := gob.NewDecoder(f).Decode(&ci); err != nil {
-		return nil
-	}
-	if ci.Version != cacheVersion || !sameStores(ci.Stores, storeFingerprint()) {
-		return nil
-	}
-	return &ci
-}
-
-// SaveCache writes the index to the gob cache.
-func SaveCache(sessions []session.SessionEntry, scannedAt time.Time) error {
-	dir, err := util.CacheDir()
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return err
-	}
-
-	path := filepath.Join(dir, "index.gob")
-	f, err := os.CreateTemp(dir, ".index-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpPath := f.Name()
-	defer os.Remove(tmpPath)
-
-	ci := CachedIndex{
-		Version:   cacheVersion,
-		ScannedAt: scannedAt,
-		Stores:    storeFingerprint(),
-		Sessions:  sessions,
-	}
-
-	if err := gob.NewEncoder(f).Encode(&ci); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-
-	return os.Rename(tmpPath, path)
-}
-
-// IsCacheValid reports whether either store changed after the scan began.
-func IsCacheValid(cache *CachedIndex) bool {
-	if cache == nil || cache.ScannedAt.IsZero() {
-		return false
-	}
-	cacheMtime := cache.ScannedAt
-	for _, s := range cache.Sessions {
-		info, err := os.Stat(s.FullPath)
-		if err != nil || info.ModTime().After(cacheMtime) || info.Size() != s.FileSize {
-			return false
-		}
-	}
-
-	return claudeStoreUnchanged(cacheMtime) && codexStoreUnchanged(cacheMtime)
-}
-
-func claudeStoreUnchanged(since time.Time) bool {
-	return storeUnchanged(provider.ClaudeProjectsDir(), since)
-}
-
-func codexStoreUnchanged(since time.Time) bool {
-	if db := provider.CodexStateDB(); db != "" {
-		for _, path := range []string{db, db + "-wal"} {
-			info, err := os.Stat(path)
+func listingSignature() (string, error) {
+	hash := sha256.New()
+	fmt.Fprintln(hash, readerVersion, listingVersion)
+	for _, root := range []string{provider.ClaudeProjectsDir(), provider.CodexSessionsDir(), provider.CodexArchivedDir()} {
+		fmt.Fprintln(hash, root)
+		err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 			if err != nil {
-				if !os.IsNotExist(err) {
-					return false
+				if path == root && os.IsNotExist(err) {
+					return nil
 				}
-				continue
+				return err
 			}
-			if info.ModTime().After(since) {
-				return false
+			if path == root && !entry.IsDir() {
+				return fmt.Errorf("%s is not a directory", root)
 			}
+			if !entry.IsDir() && !strings.HasSuffix(path, ".jsonl") && !strings.HasSuffix(path, ".jsonl.zst") && entry.Name() != "sessions-index.json" {
+				return nil
+			}
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(hash, "%q %d %d\n", path, info.Size(), info.ModTime().UnixNano())
+			return nil
+		})
+		if err != nil {
+			return "", err
 		}
 	}
-	return storeUnchanged(provider.CodexSessionsDir(), since) && storeUnchanged(provider.CodexArchivedDir(), since)
+	db := provider.CodexStateDB()
+	for _, path := range []string{db, db + "-wal"} {
+		fmt.Fprintln(hash, path)
+		if db == "" {
+			continue
+		}
+		info, err := os.Stat(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		fmt.Fprintf(hash, "%d %d\n", info.Size(), info.ModTime().UnixNano())
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
 }
 
-// Check unlisted files too: empty transcripts can gain their first message.
-func storeUnchanged(root string, since time.Time) bool {
-	if info, err := os.Stat(root); err != nil {
-		return os.IsNotExist(err)
-	} else if !info.IsDir() {
-		return false
+func loadListing(db *sql.DB, signature string) ([]session.SessionEntry, bool) {
+	var data []byte
+	if db.QueryRow("SELECT entries FROM listing WHERE id = 1 AND signature = ?", signature).Scan(&data) != nil {
+		return nil, false
 	}
-	unchanged := true
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if !d.IsDir() && filepath.Ext(path) != ".jsonl" && d.Name() != "sessions-index.json" {
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		if info.ModTime().After(since) {
-			unchanged = false
-			return filepath.SkipAll
-		}
-		return nil
-	})
-	return err == nil && unchanged
+	var entries []session.SessionEntry
+	if json.Unmarshal(data, &entries) != nil {
+		return nil, false
+	}
+	return entries, true
+}
+
+func saveListing(db *sql.DB, signature string, entries []session.SessionEntry) {
+	data, err := json.Marshal(entries)
+	if err == nil {
+		db.Exec("INSERT OR REPLACE INTO listing(id, signature, entries) VALUES (1, ?, ?)", signature, data)
+	}
 }

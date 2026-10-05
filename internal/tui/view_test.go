@@ -324,6 +324,8 @@ func TestControlCQuitsWhileSearching(t *testing.T) {
 }
 
 func TestDeepSearchDisplaysTranscriptMatches(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	entries := fixtures()[:2]
 	for i := range entries {
 		entries[i].FullPath = filepath.Join(t.TempDir(), "session.jsonl")

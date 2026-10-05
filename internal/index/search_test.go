@@ -4,16 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/LeonKohli/claude-sessions/internal/provider"
 	"github.com/LeonKohli/claude-sessions/internal/session"
 )
 
 func TestSearchReturnsMatchingConversationSnippets(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	cases := []struct {
 		name, text, query, wantSnippet string
 		maxChars                       int
@@ -32,6 +36,14 @@ func TestSearchReturnsMatchingConversationSnippets(t *testing.T) {
 		{"absent query", "no match here", "absent", "", 40},
 		{"empty text", "", "x", "", 40},
 		{"empty query", "anything", "", "", 40},
+		{"literal quotes", `foo"bar`, `foo"bar`, `foo"bar`, 40},
+		{"literal wildcards", "a%b a_b", "a%b", "a%b a_b", 40},
+		{"short unicode query", "中文搜索", "中文", "中文搜索", 40},
+		{"Go unicode lowercasing", "İstanbul", "istan", "İstanbul", 40},
+		{"Cherokee lowercasing", "xᎠx", "xꭰx", "xᎠx", 40},
+		{"NUL literal", "a\x00bc", "a\x00b", "a\x00bc", 40},
+		{"NUL is not adjacent text", "a\x00bc", "abc", "", 40},
+		{"noncharacters stay distinct", "x\ufffex", "x\ufffdx", "", 40},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -66,6 +78,8 @@ func TestSearchReturnsMatchingConversationSnippets(t *testing.T) {
 }
 
 func TestSearchReportsReadFailureAndCancellation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	sessions := []session.SessionEntry{{SessionID: "missing", FullPath: filepath.Join(t.TempDir(), "missing.jsonl")}}
 	if _, err := SearchSessions(context.Background(), sessions, "needle", 1, 80); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("missing transcript error = %v", err)
@@ -78,6 +92,8 @@ func TestSearchReportsReadFailureAndCancellation(t *testing.T) {
 }
 
 func TestSearchCountsMessagesBeyondSnippetLimit(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	path := filepath.Join(t.TempDir(), "conversation.jsonl")
 	body := strings.Repeat(`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"needle"}]}}`+"\n", 5)
 	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
@@ -90,7 +106,67 @@ func TestSearchCountsMessagesBeyondSnippetLimit(t *testing.T) {
 	}
 }
 
+func TestSearchWithoutSnippetsStillCountsMatchingMessages(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	for _, kind := range provider.All {
+		t.Run(kind.String(), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "conversation.jsonl")
+			line := `{"type":"user","message":{"role":"user","content":"needle"}}`
+			if kind == provider.Codex {
+				line = `{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"needle"}]}}`
+			}
+			if err := os.WriteFile(path, []byte(strings.Repeat(line+"\n", 5)), 0600); err != nil {
+				t.Fatal(err)
+			}
+			entries := []session.SessionEntry{{Provider: kind, SessionID: "fixture", FullPath: path}}
+			hits, err := SearchSessions(context.Background(), entries, "needle", 0, 80)
+			if err != nil || len(hits) != 1 || hits[0].Session.SessionID != "fixture" || hits[0].Matches != 5 {
+				t.Fatalf("matches lost: %+v, %v", hits, err)
+			}
+			if len(hits[0].Snippets) != 0 {
+				t.Fatalf("zero snippet budget returned %d snippets", len(hits[0].Snippets))
+			}
+		})
+	}
+}
+
+func BenchmarkSearchTranscripts(b *testing.B) {
+	b.Setenv("HOME", b.TempDir())
+	b.Setenv("XDG_CACHE_HOME", b.TempDir())
+	for _, kind := range provider.All {
+		b.Run(kind.String(), func(b *testing.B) {
+			root := b.TempDir()
+			text := strings.Repeat("ordinary conversation text ", 160) + "needle"
+			line := `{"type":"assistant","message":{"role":"assistant","content":"` + text + `"}}`
+			if kind == provider.Codex {
+				line = `{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"` + text + `"}]}}`
+			}
+			body := []byte(strings.Repeat(line+"\n", 128))
+			var entries []session.SessionEntry
+			for i := range 32 {
+				path := filepath.Join(root, fmt.Sprintf("%d.jsonl", i))
+				if err := os.WriteFile(path, body, 0600); err != nil {
+					b.Fatal(err)
+				}
+				entries = append(entries, session.SessionEntry{Provider: kind, FullPath: path})
+			}
+			b.SetBytes(int64(len(body) * len(entries)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				hits, err := SearchSessions(context.Background(), entries, "needle", 0, 80)
+				if err != nil || len(hits) != 32 || hits[0].Matches != 128 {
+					b.Fatalf("search failed: %d hits, %v", len(hits), err)
+				}
+			}
+		})
+	}
+}
+
 func TestSearchSnippetBudgetIncludesLongQueryAndRole(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	query := strings.Repeat("日本語", 40)
 	path := filepath.Join(t.TempDir(), "conversation.jsonl")
 	body := `{"type":"assistant","message":{"role":"assistant","content":"prefix ` + query + ` suffix"}}`
@@ -106,5 +182,134 @@ func TestSearchSnippetBudgetIncludesLongQueryAndRole(t *testing.T) {
 		if len([]rune(hits[0].Snippets[0])) > budget {
 			t.Errorf("budget %d exceeded: %q", budget, hits[0].Snippets[0])
 		}
+	}
+}
+
+func TestSearchUpdatesPreviouslyIndexedTranscript(t *testing.T) {
+	for _, change := range []string{"append", "replace", "truncate", "delete"} {
+		t.Run(change, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("XDG_CACHE_HOME", t.TempDir())
+			path := filepath.Join(t.TempDir(), "conversation.jsonl")
+			old := `{"type":"user","message":{"role":"user","content":"old needle"}}` + "\n"
+			if err := os.WriteFile(path, []byte(old), 0600); err != nil {
+				t.Fatal(err)
+			}
+			entries := []session.SessionEntry{{SessionID: "changing", FullPath: path}}
+			if hits, err := SearchSessions(context.Background(), entries, "needle", 1, 80); err != nil || len(hits) != 1 || hits[0].Matches != 1 {
+				t.Fatalf("initial search = %+v, %v", hits, err)
+			}
+			body := `{"type":"user","message":{"role":"user","content":"new needle"}}`
+			want := 1
+			switch change {
+			case "append":
+				body = old + body
+				want = 2
+			case "replace":
+				body += "\n"
+			case "truncate":
+				body, want = "", 0
+			case "delete":
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if change != "delete" {
+				if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+					t.Fatal(err)
+				}
+				changed := time.Now().Add(time.Second)
+				if err := os.Chtimes(path, changed, changed); err != nil {
+					t.Fatal(err)
+				}
+			}
+			hits, err := SearchSessions(context.Background(), entries, "needle", 1, 80)
+			if change == "delete" {
+				if !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("deleted transcript returned stale hits: %+v, %v", hits, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want == 0 {
+				if len(hits) != 0 {
+					t.Fatalf("truncated transcript returned stale hits: %+v", hits)
+				}
+				return
+			}
+			if len(hits) != 1 || hits[0].Session.SessionID != "changing" || hits[0].Matches != want || len(hits[0].Snippets) != 1 {
+				t.Fatalf("updated search = %+v", hits)
+			}
+			if change == "replace" && !strings.Contains(hits[0].Snippets[0], "new needle") {
+				t.Fatalf("replacement returned stale text: %+v", hits)
+			}
+		})
+	}
+}
+
+func TestSearchDropsLegacyCodexTextWhenResponseMessagesAppear(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	path := filepath.Join(t.TempDir(), "conversation.jsonl")
+	legacy := `{"type":"event_msg","payload":{"type":"user_message","message":"legacy question"}}` + "\n" +
+		`{"type":"event_msg","payload":{"type":"agent_message","message":"legacy answer"}}` + "\n"
+	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
+		t.Fatal(err)
+	}
+	entries := []session.SessionEntry{{Provider: provider.Codex, SessionID: "format-change", FullPath: path}}
+	if hits, err := SearchSessions(context.Background(), entries, "legacy", 2, 80); err != nil || len(hits) != 1 || hits[0].Matches != 2 {
+		t.Fatalf("initial legacy conversation = %+v, %v", hits, err)
+	}
+	response := `{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"canonical question"}]}}` + "\n"
+	if err := os.WriteFile(path, []byte(legacy+response), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if hits, err := SearchSessions(context.Background(), entries, "legacy", 2, 80); err != nil || len(hits) != 0 {
+		t.Fatalf("obsolete legacy conversation = %+v, %v", hits, err)
+	}
+	hits, err := SearchSessions(context.Background(), entries, "canonical", 2, 80)
+	if err != nil || len(hits) != 1 || hits[0].Session.SessionID != "format-change" || hits[0].Matches != 1 || len(hits[0].Snippets) != 1 || !strings.Contains(hits[0].Snippets[0], "canonical question") {
+		t.Fatalf("canonical conversation = %+v, %v", hits, err)
+	}
+}
+
+func BenchmarkSearchAfterAppend(b *testing.B) {
+	b.Setenv("HOME", b.TempDir())
+	b.Setenv("XDG_CACHE_HOME", b.TempDir())
+	for _, kind := range provider.All {
+		b.Run(kind.String(), func(b *testing.B) {
+			path := filepath.Join(b.TempDir(), "conversation.jsonl")
+			text := strings.Repeat("ordinary conversation text ", 80) + "needle"
+			line := `{"type":"user","message":{"role":"user","content":"` + text + `"}}` + "\n"
+			if kind == provider.Codex {
+				line = `{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"` + text + `"}]}}` + "\n"
+			}
+			if err := os.WriteFile(path, []byte(strings.Repeat(line, 2048)), 0600); err != nil {
+				b.Fatal(err)
+			}
+			entries := []session.SessionEntry{{Provider: kind, SessionID: "growing", FullPath: path}}
+			if _, err := SearchSessions(context.Background(), entries, "needle", 0, 80); err != nil {
+				b.Fatal(err)
+			}
+			file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer file.Close()
+			matches := 2048
+			b.ResetTimer()
+			for b.Loop() {
+				if _, err := file.WriteString(line); err != nil {
+					b.Fatal(err)
+				}
+				matches++
+				hits, err := SearchSessions(context.Background(), entries, "needle", 0, 80)
+				if err != nil || len(hits) != 1 || hits[0].Session.SessionID != "growing" || hits[0].Matches != matches {
+					b.Fatalf("appended conversation = %+v, %v", hits, err)
+				}
+			}
+		})
 	}
 }

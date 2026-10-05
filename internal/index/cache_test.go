@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"reflect"
 	"testing"
 	"time"
 
@@ -12,41 +11,43 @@ import (
 	"github.com/LeonKohli/claude-sessions/internal/session"
 )
 
-// The cache lives at one fixed path but the stores it indexes are relocatable
-// via CLAUDE_CONFIG_DIR and CODEX_HOME. Pointing at different homes must not
-// serve the previous homes' sessions.
 func TestCacheIsScopedToItsStores(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(root, "cache"))
-	t.Setenv("CLAUDE_CONFIG_DIR", "/tmp/home-a/.claude")
-	t.Setenv("CODEX_HOME", "/tmp/home-a/.codex")
-
-	fixture := []session.SessionEntry{{
-		Provider: provider.Codex, SessionID: "abc", FullPath: "/tmp/a.jsonl", Summary: "hi",
-	}}
-	if err := SaveCache(fixture, time.Now()); err != nil {
-		t.Fatalf("SaveCache: %v", err)
-	}
-
-	if got := LoadCache(); got == nil || !reflect.DeepEqual(got.Sessions, fixture) {
-		t.Fatalf("cache did not round-trip for the stores that wrote it: %+v", got)
-	}
-
-	t.Setenv("CODEX_HOME", "/tmp/home-b/.codex")
-	if got := LoadCache(); got != nil {
-		t.Errorf("cache from a different CODEX_HOME was reused: %d sessions", len(got.Sessions))
-	}
-
-	t.Setenv("CODEX_HOME", "/tmp/home-a/.codex")
-	t.Setenv("CLAUDE_CONFIG_DIR", "/tmp/home-b/.claude")
-	if got := LoadCache(); got != nil {
-		t.Errorf("cache from a different CLAUDE_CONFIG_DIR was reused: %d sessions", len(got.Sessions))
+	for _, home := range []string{"home-a", "home-b", "home-a"} {
+		claude := filepath.Join(root, home, "claude")
+		codex := filepath.Join(root, home, "codex")
+		t.Setenv("CLAUDE_CONFIG_DIR", claude)
+		t.Setenv("CODEX_HOME", codex)
+		t.Setenv("CODEX_SQLITE_HOME", codex)
+		for path, body := range map[string]string{
+			filepath.Join(claude, "projects", "project", home+".jsonl"): `{"type":"user","message":{"role":"user","content":"` + home + `"}}`,
+			filepath.Join(codex, "sessions", home+".jsonl"):             `{"type":"session_meta","payload":{"id":"` + home + `"}}` + "\n" + `{"type":"event_msg","payload":{"type":"user_message","message":"` + home + `"}}`,
+		} {
+			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, err := Load(provider.All)
+		if err != nil || len(got) != 2 {
+			t.Fatalf("relocated stores = %+v, %v", got, err)
+		}
+		for _, entry := range got {
+			if entry.SessionID != home || entry.FirstPrompt != home {
+				t.Fatalf("another store's session returned: %+v", entry)
+			}
+		}
 	}
 }
 
-func TestCacheRejectsChangesAfterScanStarted(t *testing.T) {
+func TestLoadSeesSameSizeTranscriptReplacement(t *testing.T) {
 	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(root, "cache"))
 	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(root, "claude"))
 	t.Setenv("CODEX_HOME", filepath.Join(root, "codex"))
 	t.Setenv("CODEX_SQLITE_HOME", filepath.Join(root, "sqlite"))
@@ -54,23 +55,21 @@ func TestCacheRejectsChangesAfterScanStarted(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte("old"), 0600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"type":"user","message":{"role":"user","content":"alpha"}}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	started := time.Now()
-	cache := &CachedIndex{ScannedAt: started, Sessions: []session.SessionEntry{{FullPath: path, FileSize: 3}}}
-	if !IsCacheValid(cache) {
-		t.Fatal("unchanged store rejected")
+	if got, err := Load(provider.All); err != nil || len(got) != 1 || got[0].FirstPrompt != "alpha" {
+		t.Fatalf("initial prompt = %+v, %v", got, err)
 	}
-	if err := os.WriteFile(path, []byte("new"), 0600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"type":"user","message":{"role":"user","content":"bravo"}}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	changed := started.Add(time.Second)
+	changed := time.Now().Add(time.Second)
 	if err := os.Chtimes(path, changed, changed); err != nil {
 		t.Fatal(err)
 	}
-	if IsCacheValid(cache) {
-		t.Fatal("same-size change after scan was accepted as current")
+	if got, err := Load(provider.All); err != nil || len(got) != 1 || got[0].FirstPrompt != "bravo" {
+		t.Fatalf("replacement prompt = %+v, %v", got, err)
 	}
 }
 
@@ -131,8 +130,45 @@ func TestClaudeIndexDoesNotOverrideNewerTranscript(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "sessions-index.json"), raw, 0600); err != nil {
 		t.Fatal(err)
 	}
-	got, err := ScanClaude()
+	got, err := scanClaude(testIndex(t))
 	if err != nil || len(got) != 1 || got[0].SessionID != "current" || got[0].FullPath != path || got[0].FirstPrompt != "current prompt" || got[0].Modified.Year() == 2020 {
 		t.Fatalf("stale index reused: %v, err %v", got, err)
+	}
+}
+
+func TestMovedClaudeStoreUsesItsLocalTranscript(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(root, "cache"))
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(root, "claude"))
+	t.Setenv("CODEX_HOME", filepath.Join(root, "codex"))
+	t.Setenv("CODEX_SQLITE_HOME", filepath.Join(root, "codex"))
+	dir := filepath.Join(root, "claude", "projects", "project")
+	local := filepath.Join(dir, "moved.jsonl")
+	original := filepath.Join(root, "original", "moved.jsonl")
+	for path, prompt := range map[string]string{local: "local conversation", original: "old conversation"} {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		body := `{"type":"user","cwd":"/work","message":{"role":"user","content":"` + prompt + `"}}` + "\n"
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	info, err := os.Stat(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := session.SessionsIndex{Entries: []session.SessionIndexEntry{{SessionID: "moved", FullPath: original, FirstPrompt: "old conversation", FileMtime: float64(info.ModTime().UnixMilli())}}}
+	raw, err := json.Marshal(idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sessions-index.json"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load([]provider.Kind{provider.Claude})
+	if err != nil || len(got) != 1 || got[0].FullPath != local || got[0].FirstPrompt != "local conversation" {
+		t.Fatalf("moved store returned the wrong conversation: %+v, %v", got, err)
 	}
 }

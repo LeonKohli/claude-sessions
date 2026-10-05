@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/LeonKohli/claude-sessions/internal/provider"
 	"github.com/LeonKohli/claude-sessions/internal/session"
@@ -37,7 +39,7 @@ func TestCodexMissingSelectedRolloutDoesNotReadOldHistory(t *testing.T) {
 	if _, err = db.Exec(`INSERT INTO threads VALUES(?,?,?,?,?,?)`, "reverted", filepath.Join(dir, "missing.jsonl"), "/tmp", 1, 2, "paginated"); err != nil {
 		t.Fatal(err)
 	}
-	got, err := ScanCodex()
+	got, err := scanCodex(testIndex(t))
 	if err == nil {
 		t.Fatalf("missing selected history silently fell back: %+v", got)
 	}
@@ -75,7 +77,7 @@ func TestCodexMissingAncestorDoesNotReadOldHistory(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			entries, err := ScanCodex()
+			entries, err := scanCodex(testIndex(t))
 			if !errors.Is(err, session.ErrHistoryUnavailable) {
 				t.Fatalf("unavailable history became entries=%+v err=%v", entries, err)
 			}
@@ -118,7 +120,7 @@ func TestCodexIndexesInheritedPromptWithChildIdentity(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			entries, err := ScanCodex()
+			entries, err := scanCodex(testIndex(t))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -141,6 +143,8 @@ func TestCodexIndexesInheritedPromptWithChildIdentity(t *testing.T) {
 
 func TestSearchSeesNewAmbiguityInHistoryArchive(t *testing.T) {
 	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(root, "cache"))
 	t.Setenv("CODEX_HOME", root)
 	dir := filepath.Join(root, "sessions")
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -172,5 +176,44 @@ func TestSearchSeesNewAmbiguityInHistoryArchive(t *testing.T) {
 	}
 	if _, err := SearchSessions(context.Background(), entries, "needle", 1, 80); !errors.Is(err, session.ErrHistoryUnavailable) {
 		t.Fatalf("new ambiguous ancestor ignored: %v", err)
+	}
+}
+
+func TestSearchUpdatesInheritedTextWithoutChangingChild(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(root, "cache"))
+	t.Setenv("CODEX_HOME", root)
+	dir := filepath.Join(root, "sessions")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	const parentID = "00000000-0000-0000-0000-000000000001"
+	parent := filepath.Join(dir, "rollout-2026-09-26T00-00-00-"+parentID+".jsonl")
+	prefix := `{"ordinal":0,"type":"session_meta","payload":{"history_mode":"paginated"}}` + "\n" +
+		`{"ordinal":1,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"old inherited text"}]}}` + "\n"
+	if err := os.WriteFile(parent, []byte(prefix), 0600); err != nil {
+		t.Fatal(err)
+	}
+	child := filepath.Join(dir, "child.jsonl")
+	body := fmt.Sprintf(`{"ordinal":2,"type":"session_meta","payload":{"history_mode":"paginated","history_base":{"thread_id":%q,"end_ordinal_exclusive":2,"end_byte_offset":%d}}}`+"\n", parentID, len(prefix))
+	if err := os.WriteFile(child, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	entries := []session.SessionEntry{{Provider: provider.Codex, SessionID: "child", FullPath: child}}
+	if hits, err := SearchSessions(context.Background(), entries, "old inherited", 1, 80); err != nil || len(hits) != 1 || hits[0].Session.SessionID != "child" {
+		t.Fatalf("initial inherited search = %+v, %v", hits, err)
+	}
+	updated := strings.Replace(prefix, "old inherited text", "new inherited text", 1)
+	if err := os.WriteFile(parent, []byte(updated), 0600); err != nil {
+		t.Fatal(err)
+	}
+	changed := time.Now().Add(time.Second)
+	if err := os.Chtimes(parent, changed, changed); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := SearchSessions(context.Background(), entries, "new inherited", 1, 80)
+	if err != nil || len(hits) != 1 || hits[0].Session.SessionID != "child" || hits[0].Matches != 1 || len(hits[0].Snippets) != 1 || !strings.Contains(hits[0].Snippets[0], "new inherited text") {
+		t.Fatalf("changed ancestor not reflected: %+v, %v", hits, err)
 	}
 }

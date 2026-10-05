@@ -1,7 +1,6 @@
 package index
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -22,20 +21,20 @@ import (
 	"github.com/LeonKohli/claude-sessions/internal/util"
 )
 
-// ScanCodex builds the Codex half of the index. Codex maintains its own
+// scanCodex builds the Codex half of the index. Codex maintains its own
 // SQLite thread index — the same one `codex resume` trusts — which carries the
 // title, token total and model without touching a single rollout file. When it
 // is missing or its schema has drifted, fall back to reading the rollouts.
-func ScanCodex() ([]session.SessionEntry, error) {
-	if entries, err := scanCodexStateDB(); err == nil && len(entries) > 0 {
+func scanCodex(cache *metadataCache) ([]session.SessionEntry, error) {
+	if entries, err := scanCodexStateDB(cache); err == nil && len(entries) > 0 {
 		return entries, nil
 	} else if errors.Is(err, ErrStoreUnavailable) {
 		return nil, err
 	}
-	return scanCodexRollouts()
+	return scanCodexRollouts(cache)
 }
 
-func scanCodexStateDB() ([]session.SessionEntry, error) {
+func scanCodexStateDB(cache *metadataCache) ([]session.SessionEntry, error) {
 	dbPath := provider.CodexStateDB()
 	if dbPath == "" {
 		return nil, fmt.Errorf("no codex state database")
@@ -125,7 +124,7 @@ func scanCodexStateDB() ([]session.SessionEntry, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	return backfillUntitled(entries)
+	return backfillUntitled(cache, entries)
 }
 
 // backfillUntitled recovers display text for threads the state database never
@@ -133,7 +132,7 @@ func scanCodexStateDB() ([]session.SessionEntry, error) {
 // while their transcript holds a real prompt, so trusting the database alone
 // would hide them. Entries with no prompt in either place have no conversation
 // and are dropped.
-func backfillUntitled(entries []session.SessionEntry) ([]session.SessionEntry, error) {
+func backfillUntitled(cache *metadataCache, entries []session.SessionEntry) ([]session.SessionEntry, error) {
 	reader := new(session.CodexReader)
 	readErrors := make([]error, len(entries))
 	var pending []int
@@ -151,12 +150,12 @@ func backfillUntitled(entries []session.SessionEntry) ([]session.SessionEntry, e
 		close(jobs)
 
 		var wg sync.WaitGroup
-		for w := 0; w < runtime.NumCPU(); w++ {
+		for w := 0; w < min(2, runtime.GOMAXPROCS(0), len(pending)); w++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				for i := range jobs {
-					_, prompt, model, _, ok, err := reader.ReadHead(context.Background(), entries[i].FullPath)
+					_, prompt, model, _, ok, err := readCodexHead(cache, reader, entries[i].FullPath)
 					if err != nil {
 						readErrors[i] = err
 						continue
@@ -191,7 +190,7 @@ func backfillUntitled(entries []session.SessionEntry) ([]session.SessionEntry, e
 
 // scanCodexRollouts reads session_meta headers straight from the rollout files.
 // Used when the state database is absent or unreadable.
-func scanCodexRollouts() ([]session.SessionEntry, error) {
+func scanCodexRollouts(cache *metadataCache) ([]session.SessionEntry, error) {
 	reader := new(session.CodexReader)
 	var paths []string
 	for _, root := range []string{provider.CodexSessionsDir(), provider.CodexArchivedDir()} {
@@ -229,7 +228,7 @@ func scanCodexRollouts() ([]session.SessionEntry, error) {
 	results := make(chan session.SessionEntry, len(paths))
 	readErrors := make(chan error, len(paths))
 	var wg sync.WaitGroup
-	for i := 0; i < runtime.NumCPU(); i++ {
+	for i := 0; i < min(2, runtime.GOMAXPROCS(0), len(paths)); i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -238,7 +237,7 @@ func scanCodexRollouts() ([]session.SessionEntry, error) {
 				if err != nil {
 					continue
 				}
-				meta, prompt, model, ts, ok, err := reader.ReadHead(context.Background(), path)
+				meta, prompt, model, ts, ok, err := readCodexHead(cache, reader, path)
 				if err != nil {
 					readErrors <- fmt.Errorf("%w: %s: %w", ErrStoreUnavailable, path, err)
 					continue

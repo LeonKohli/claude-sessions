@@ -13,7 +13,7 @@ This reference separates provider documentation from observed internal formats a
 | Claude checkpoint files referenced by `file-history-snapshot` | Historical file bytes, subject to retention | `internal/session/files.go` |
 | Codex `sessions/` and `archived_sessions/` under `CODEX_HOME`, default `~/.codex` | Persisted rollout records | `internal/session/codex.go`, `calls.go` |
 | Codex `state_<n>.sqlite` under `CODEX_SQLITE_HOME` or `CODEX_HOME` | Thread metadata and rollout locations | `internal/index/codex.go` |
-| `agent-sessions/index.gob` in the OS user cache directory | Rebuildable discovery metadata | `internal/index/cache.go` |
+| `agent-sessions/index.sqlite` in the OS user cache directory | Rebuildable metadata and conversation search text | `internal/index/database.go` |
 
 Claude explicitly calls its JSONL entry format internal and warns that it can change between releases. Project directory encoding is not reversible: it replaces non-alphanumeric characters and can truncate long names or use a configured name. Recorded working directories take precedence over decoding directory names. Retention and disabled persistence can remove or prevent local history. See [Claude session storage](https://code.claude.com/docs/en/sessions).
 
@@ -57,7 +57,9 @@ Envelope `truncated` describes omitted records. Search snippets are previews eve
 
 For search, a positive `--max-chars` bounds each snippet in Unicode characters, including its role label. The label is omitted when it leaves no room for content.
 
-An empty search means no recognized matches among discovered sessions under the filters. Missing provider directories are allowed. Errors enumerating a selected provider's directories return `store_unavailable` instead of empty success; incomplete discovery is not cached. Individual unreadable or unrecognized transcript headers can still be skipped during discovery, and malformed records are skipped during parsing. Errors reading an already indexed transcript propagate. Empty results therefore do not establish complete historical coverage.
+An empty search means no recognized matches among discovered sessions under the filters. Missing provider directories are allowed. Errors enumerating a selected provider's directories return `store_unavailable` instead of empty success. Individual unreadable or unrecognized transcript headers can still be skipped during discovery, and malformed records are skipped during parsing. Search checks file signatures, uses persisted text for unchanged transcripts, and propagates errors refreshing changed transcripts. Missing or ambiguous Codex ancestors still fail after indexing. Empty results therefore do not establish complete historical coverage.
+
+Discovery and search each wait at most five seconds for the shared index lock. Lock contention beyond that wait returns `store_unavailable` with a retry hint. Changed transcripts are reread, but unchanged conversation messages retain their existing full-text index entries.
 
 ## Provider interfaces for comparison
 

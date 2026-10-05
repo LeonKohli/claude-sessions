@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -14,6 +15,7 @@ import (
 )
 
 func main() {
+	runtime.GOMAXPROCS(min(2, runtime.GOMAXPROCS(0)))
 	// Subcommands and piped invocations are handled non-interactively; only a
 	// bare call from a terminal reaches the browser below.
 	exit, runTUI := cli.Run(os.Args[1:])

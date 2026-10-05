@@ -14,8 +14,8 @@ import (
 	"github.com/LeonKohli/claude-sessions/internal/util"
 )
 
-// ScanClaude walks ~/.claude/projects/ and builds the Claude half of the index.
-func ScanClaude() ([]session.SessionEntry, error) {
+// scanClaude walks the Claude store and reuses unchanged raw metadata.
+func scanClaude(cache *metadataCache) ([]session.SessionEntry, error) {
 	projectsDir := provider.ClaudeProjectsDir()
 	entries, err := os.ReadDir(projectsDir)
 	if err != nil {
@@ -67,7 +67,7 @@ func ScanClaude() ([]session.SessionEntry, error) {
 		}
 	}
 
-	return append(allSessions, scanClaudeFiles(uncovered)...), nil
+	return append(allSessions, scanClaudeFiles(cache, uncovered)...), nil
 }
 
 type claudeScanJob struct {
@@ -78,7 +78,7 @@ type claudeScanJob struct {
 
 // scanClaudeFiles reads session headers concurrently. Subagent transcripts make
 // up well over half the store, so a serial pass here dominates the cold scan.
-func scanClaudeFiles(jobs []claudeScanJob) []session.SessionEntry {
+func scanClaudeFiles(cache *metadataCache, jobs []claudeScanJob) []session.SessionEntry {
 	if len(jobs) == 0 {
 		return nil
 	}
@@ -91,12 +91,12 @@ func scanClaudeFiles(jobs []claudeScanJob) []session.SessionEntry {
 
 	results := make(chan session.SessionEntry, len(jobs))
 	var wg sync.WaitGroup
-	for i := 0; i < runtime.NumCPU(); i++ {
+	for i := 0; i < min(2, runtime.GOMAXPROCS(0), len(jobs)); i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for j := range queue {
-				s, err := scanJSONLFile(j.path, j.originalPath, j.dirName)
+				s, err := cachedClaude(cache, j)
 				if err != nil {
 					continue
 				}
@@ -131,7 +131,11 @@ func parseSessionsIndex(path, dirName string) ([]session.SessionEntry, string, e
 	}
 
 	var results []session.SessionEntry
+	projectDir := filepath.Dir(path) + string(filepath.Separator)
 	for _, e := range idx.Entries {
+		if !strings.HasPrefix(filepath.Clean(e.FullPath), projectDir) {
+			continue
+		}
 		// Skip ghost entries — file must actually exist on disk
 		info, err := os.Stat(e.FullPath)
 		if err != nil {
