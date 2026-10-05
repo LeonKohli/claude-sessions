@@ -8,8 +8,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/LeonKohli/claude-sessions/internal/provider"
@@ -36,7 +38,7 @@ func openIndex(ctx context.Context) (*sql.DB, error) {
 	if err := f.Close(); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", (&url.URL{Scheme: "file", Path: path, RawQuery: "_pragma=busy_timeout(3000)"}).String())
+	db, err := sql.Open("sqlite", (&url.URL{Scheme: "file", Path: path, RawQuery: "_pragma=busy_timeout(3000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"}).String())
 	if err != nil {
 		return nil, err
 	}
@@ -51,23 +53,59 @@ CREATE INDEX IF NOT EXISTS messages_transcript ON search_messages(transcript, or
 CREATE VIRTUAL TABLE IF NOT EXISTS search_text USING fts5(
  folded, content='search_messages', content_rowid='id', tokenize='trigram case_sensitive 1'
 );
-CREATE TRIGGER IF NOT EXISTS messages_insert AFTER INSERT ON search_messages BEGIN
- INSERT INTO search_text(rowid, folded) VALUES (new.id, new.folded);
-END;
-CREATE TRIGGER IF NOT EXISTS messages_delete AFTER DELETE ON search_messages BEGIN
- INSERT INTO search_text(search_text, rowid, folded) VALUES ('delete', old.id, old.folded);
-END;
 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, signature TEXT NOT NULL, entry BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS listing (id INTEGER PRIMARY KEY CHECK(id = 1), signature TEXT NOT NULL, entries BLOB NOT NULL);
 CREATE TEMP TABLE wanted (key TEXT PRIMARY KEY);
 CREATE TEMP TABLE matches (id INTEGER PRIMARY KEY, transcript TEXT NOT NULL);
 CREATE INDEX matches_transcript ON matches(transcript);
 `)
+	if err == nil {
+		err = syncSearchText(ctx, db)
+	}
 	if err != nil {
 		db.Close()
 		return nil, err
 	}
 	return db, nil
+}
+
+const searchTriggers = `
+CREATE TRIGGER messages_insert AFTER INSERT ON search_messages BEGIN
+ INSERT INTO search_text(rowid, folded) VALUES (new.id, new.folded);
+END;
+CREATE TRIGGER messages_delete AFTER DELETE ON search_messages BEGIN
+ INSERT INTO search_text(search_text, rowid, folded) VALUES ('delete', old.id, old.folded);
+END;`
+
+// syncSearchText restores trigger maintenance of the full-text index. Missing
+// triggers mean a bulk load wrote messages without indexing them, so the index
+// is rebuilt from the stored messages first.
+func syncSearchText(ctx context.Context, db *sql.DB) error {
+	var triggers int
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_schema WHERE type = 'trigger' AND name IN ('messages_insert', 'messages_delete')").Scan(&triggers); err != nil || triggers == 2 {
+		return err
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// Merging while rebuilding costs about a third of the build and no query
+	// time measured afterwards; later writes resume default merging.
+	if _, err := tx.ExecContext(ctx, `DROP TRIGGER IF EXISTS messages_insert; DROP TRIGGER IF EXISTS messages_delete;
+INSERT INTO search_text(search_text, rank) VALUES ('automerge', 0);
+INSERT INTO search_text(search_text) VALUES ('rebuild');
+INSERT INTO search_text(search_text, rank) VALUES ('automerge', 4);`+searchTriggers); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// bulkLoadSearchText stops per-row full-text maintenance until syncSearchText
+// runs. One rebuild after a cold load is about twice as fast as the triggers.
+func bulkLoadSearchText(db *sql.DB) error {
+	_, err := db.Exec("DROP TRIGGER IF EXISTS messages_insert; DROP TRIGGER IF EXISTS messages_delete;")
+	return err
 }
 
 func pruneIndex(db *sql.DB) error {
@@ -262,50 +300,166 @@ func readCodexHead(cache *metadataCache, reader *session.CodexReader, path strin
 	return meta, prompt, model, ts, ok, err
 }
 
-func indexTranscript(ctx context.Context, db *sql.DB, reader *session.CodexReader, s session.SessionEntry, saved string) error {
-	key := transcriptKey(s.Provider, s.FullPath)
+// parsedTranscript is one transcript's search text, read while its signature held.
+type parsedTranscript struct {
+	order     int
+	key       string
+	signature string
+	lines     []session.SearchableLine
+	err       error
+}
+
+// Commit after this much text so a cold build pays for few fsyncs while an
+// interrupted build keeps most of its progress.
+const commitBytes = 64 << 20
+
+// indexSessions brings the stored search text up to date with sessions.
+// Workers parse transcripts concurrently; one writer owns the database.
+// It reports the error of the earliest failing session, as a serial scan would.
+func indexSessions(ctx context.Context, db *sql.DB, sessions []session.SessionEntry, signatures map[string]string) error {
+	if len(signatures) == 0 {
+		if err := bulkLoadSearchText(db); err != nil {
+			return err
+		}
+	}
+	parent := ctx
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
+	reader := new(session.CodexReader)
+	jobs := make(chan int)
+	parsed := make(chan parsedTranscript, 2*runtime.GOMAXPROCS(0))
+	var workers sync.WaitGroup
+	for range runtime.GOMAXPROCS(0) {
+		workers.Go(func() {
+			for i := range jobs {
+				s := sessions[i]
+				key := transcriptKey(s.Provider, s.FullPath)
+				result := parseTranscript(ctx, reader, s, signatures[key])
+				result.order, result.key = i, key
+				parsed <- result
+			}
+		})
+	}
+	go func() {
+		defer close(parsed)
+		defer workers.Wait()
+		defer close(jobs)
+		for i := range sessions {
+			select {
+			case jobs <- i:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	firstErr, firstOrder := error(nil), len(sessions)
+	fail := func(order int, err error) {
+		if order < firstOrder {
+			firstErr, firstOrder = err, order
+		}
+	}
+	var tx *sql.Tx
+	pending := 0
+	commit := func() error {
+		if tx == nil {
+			return nil
+		}
+		err := tx.Commit()
+		tx, pending = nil, 0
+		return err
+	}
+	var writeErr error
+	for result := range parsed {
+		if result.err != nil {
+			fail(result.order, fmt.Errorf("session %s: %w", sessions[result.order].SessionID, result.err))
+			continue
+		}
+		if writeErr != nil || result.lines == nil {
+			continue
+		}
+		if tx == nil {
+			// Writes do not use ctx: cancellation must not roll back finished transcripts.
+			if tx, writeErr = db.Begin(); writeErr != nil {
+				stop()
+				continue
+			}
+		}
+		if writeErr = storeTranscript(tx, result); writeErr != nil {
+			tx.Rollback()
+			tx = nil
+			stop()
+			continue
+		}
+		for _, line := range result.lines {
+			pending += len(line.Text)
+		}
+		if pending >= commitBytes {
+			if writeErr = commit(); writeErr != nil {
+				stop()
+			}
+		}
+	}
+	if err := commit(); writeErr == nil {
+		writeErr = err
+	}
+	if writeErr != nil {
+		return writeErr
+	}
+	// After cancellation the next open finishes the rebuild instead.
+	if err := parent.Err(); err != nil {
+		return err
+	}
+	if err := syncSearchText(parent, db); err != nil {
+		return err
+	}
+	return firstErr
+}
+
+// parseTranscript reads a changed transcript. A nil lines slice means the
+// stored text is current; a transcript that keeps changing is an error.
+func parseTranscript(ctx context.Context, reader *session.CodexReader, s session.SessionEntry, saved string) parsedTranscript {
 	for range 3 {
 		signature, err := transcriptSignature(ctx, reader, s.Provider, s.FullPath, saved)
 		if err != nil {
-			return err
+			return parsedTranscript{err: err}
 		}
 		if saved == signature {
-			return nil
+			return parsedTranscript{}
 		}
-		tx, err := db.BeginTx(ctx, nil)
-		if err != nil {
-			return err
+		lines := []session.SearchableLine{}
+		visit := func(line session.SearchableLine) bool {
+			lines = append(lines, line)
+			return true
 		}
-		err = syncTranscript(ctx, tx, reader, s, key)
+		if s.Provider == provider.Codex {
+			err = reader.WalkText(ctx, s.FullPath, visit)
+		} else {
+			err = session.WalkSearchable(ctx, s.Provider, s.FullPath, visit)
+		}
 		if err != nil {
-			tx.Rollback()
-			return err
+			return parsedTranscript{err: err}
 		}
 		after, err := transcriptSignature(ctx, reader, s.Provider, s.FullPath, "")
 		if err != nil {
-			tx.Rollback()
-			return err
+			return parsedTranscript{err: err}
 		}
-		if after != signature {
-			tx.Rollback()
-			continue
+		if after == signature {
+			return parsedTranscript{signature: signature, lines: lines}
 		}
-		if _, err = tx.ExecContext(ctx, "INSERT OR REPLACE INTO transcripts(key, signature) VALUES (?, ?)", key, signature); err != nil {
-			tx.Rollback()
-			return err
-		}
-		return tx.Commit()
 	}
-	return fmt.Errorf("transcript keeps changing while indexing: %s", s.FullPath)
+	return parsedTranscript{err: fmt.Errorf("transcript keeps changing while indexing: %s", s.FullPath)}
 }
 
-func syncTranscript(ctx context.Context, tx *sql.Tx, reader *session.CodexReader, s session.SessionEntry, key string) error {
+// storeTranscript replaces changed messages and keeps unchanged rows, so
+// appending to a transcript does not rewrite its full-text entries.
+func storeTranscript(tx *sql.Tx, t parsedTranscript) error {
 	type indexedMessage struct {
 		id                 int64
 		role, source, text string
 		line               int
 	}
-	rows, err := tx.QueryContext(ctx, "SELECT id, ordinal, role, text, source, line FROM search_messages WHERE transcript = ?", key)
+	rows, err := tx.Query("SELECT id, ordinal, role, text, source, line FROM search_messages WHERE transcript = ?", t.key)
 	if err != nil {
 		return err
 	}
@@ -324,37 +478,28 @@ func syncTranscript(ctx context.Context, tx *sql.Tx, reader *session.CodexReader
 	if err != nil {
 		return err
 	}
-	insert, err := tx.PrepareContext(ctx, "INSERT INTO search_messages(transcript, ordinal, role, text, folded, source, line) VALUES (?, ?, ?, ?, ?, ?, ?)")
+	insert, err := tx.Prepare("INSERT INTO search_messages(transcript, ordinal, role, text, folded, source, line) VALUES (?, ?, ?, ?, ?, ?, ?)")
 	if err != nil {
 		return err
 	}
 	defer insert.Close()
-	ordinal := 0
-	var writeErr error
-	visit := func(line session.SearchableLine) bool {
-		ordinal++
+	for i, line := range t.lines {
+		ordinal := i + 1
 		if old, ok := previous[ordinal]; ok {
 			if old.text == line.Text && old.role == line.Role && old.source == line.Source && old.line == line.LineNum {
-				return true
+				continue
 			}
-			if _, writeErr = tx.ExecContext(ctx, "DELETE FROM search_messages WHERE id = ?", old.id); writeErr != nil {
-				return false
+			if _, err := tx.Exec("DELETE FROM search_messages WHERE id = ?", old.id); err != nil {
+				return err
 			}
 		}
-		_, writeErr = insert.ExecContext(ctx, key, ordinal, line.Role, line.Text, strings.ToLower(line.Text), line.Source, line.LineNum)
-		return writeErr == nil
+		if _, err := insert.Exec(t.key, ordinal, line.Role, line.Text, strings.ToLower(line.Text), line.Source, line.LineNum); err != nil {
+			return err
+		}
 	}
-	if s.Provider == provider.Codex {
-		err = reader.WalkText(ctx, s.FullPath, visit)
-	} else {
-		err = session.WalkSearchable(ctx, s.Provider, s.FullPath, visit)
-	}
-	if err != nil {
+	if _, err := tx.Exec("DELETE FROM search_messages WHERE transcript = ? AND ordinal > ?", t.key, len(t.lines)); err != nil {
 		return err
 	}
-	if writeErr != nil {
-		return writeErr
-	}
-	_, err = tx.ExecContext(ctx, "DELETE FROM search_messages WHERE transcript = ? AND ordinal > ?", key, ordinal)
+	_, err = tx.Exec("INSERT OR REPLACE INTO transcripts(key, signature) VALUES (?, ?)", t.key, t.signature)
 	return err
 }

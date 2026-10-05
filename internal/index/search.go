@@ -2,7 +2,6 @@ package index
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"unicode/utf8"
 
@@ -40,11 +39,8 @@ func SearchSessions(ctx context.Context, sessions []session.SessionEntry, query 
 	if err != nil {
 		return nil, err
 	}
-	reader := new(session.CodexReader)
-	for _, s := range sessions {
-		if err := indexTranscript(ctx, db, reader, s, signatures[transcriptKey(s.Provider, s.FullPath)]); err != nil {
-			return nil, fmt.Errorf("session %s: %w", s.SessionID, err)
-		}
+	if err := indexSessions(ctx, db, sessions, signatures); err != nil {
+		return nil, err
 	}
 	if err := wantSessions(ctx, db, sessions); err != nil {
 		return nil, err

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -311,5 +312,74 @@ func BenchmarkSearchAfterAppend(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func TestSearchAcrossManyTranscriptsReportsEarliestFailure(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	root := t.TempDir()
+	var entries []session.SessionEntry
+	for i := range 40 {
+		path := filepath.Join(root, fmt.Sprintf("%02d.jsonl", i))
+		if i != 7 && i != 31 {
+			line := fmt.Sprintf(`{"type":"user","message":{"role":"user","content":"needle in session %02d"}}`+"\n", i)
+			if err := os.WriteFile(path, []byte(line), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		entries = append(entries, session.SessionEntry{Provider: provider.Claude, SessionID: fmt.Sprintf("s%02d", i), FullPath: path})
+	}
+	_, err := SearchSessions(context.Background(), entries, "needle", 1, 80)
+	if !errors.Is(err, os.ErrNotExist) || !strings.Contains(err.Error(), "session s07:") {
+		t.Fatalf("error = %v, want the missing transcript of s07", err)
+	}
+	present := slices.DeleteFunc(slices.Clone(entries), func(s session.SessionEntry) bool { return s.SessionID == "s07" || s.SessionID == "s31" })
+	hits, err := SearchSessions(context.Background(), present, "needle", 1, 80)
+	if err != nil || len(hits) != len(present) {
+		t.Fatalf("hits = %d, %v; want %d", len(hits), err, len(present))
+	}
+	for i, hit := range hits {
+		want := "needle in session " + strings.TrimPrefix(present[i].SessionID, "s")
+		if hit.Session.SessionID != present[i].SessionID || hit.Matches != 1 || len(hit.Snippets) != 1 || !strings.Contains(hit.Snippets[0], want) {
+			t.Fatalf("hit %d = %+v, want %q", i, hit, want)
+		}
+	}
+}
+
+// A process can stop between storing bulk-loaded messages and indexing them.
+// The stored transcript is current, so only the index recovery makes it searchable.
+func TestSearchFindsMessagesFromInterruptedBulkLoad(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	path := filepath.Join(t.TempDir(), "conversation.jsonl")
+	if err := os.WriteFile(path, []byte(`{"type":"user","message":{"role":"user","content":"needle after restart"}}`+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	entry := session.SessionEntry{Provider: provider.Claude, SessionID: "interrupted", FullPath: path}
+	db, err := openIndex(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bulkLoadSearchText(db); err != nil {
+		t.Fatal(err)
+	}
+	parsed := parseTranscript(context.Background(), new(session.CodexReader), entry, "")
+	parsed.key = transcriptKey(entry.Provider, entry.FullPath)
+	tx, err := db.Begin()
+	if err != nil || parsed.err != nil {
+		t.Fatal(err, parsed.err)
+	}
+	if err := storeTranscript(tx, parsed); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	hits, err := SearchSessions(context.Background(), []session.SessionEntry{entry}, "after restart", 1, 80)
+	if err != nil || len(hits) != 1 || hits[0].Session.SessionID != "interrupted" || hits[0].Matches != 1 || !strings.Contains(hits[0].Snippets[0], "needle after restart") {
+		t.Fatalf("hits = %+v, %v", hits, err)
 	}
 }
