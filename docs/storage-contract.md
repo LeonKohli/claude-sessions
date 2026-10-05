@@ -1,72 +1,73 @@
-# Session storage and evidence
+# Storage and evidence
 
-`agent-sessions` reads local archives. Its output is not a reconstruction of the exact context an agent would receive on resume, or a complete filesystem journal.
+`agent-sessions` reads local archives. Its output does not reconstruct the exact context an agent receives on resume, and it is not a complete record of filesystem changes.
 
-This reference separates provider documentation from observed internal formats and the current reader's limits. Internal-format observations cover Claude Code 2.1.72 and 2.1.266, and Codex 0.157.1 and 0.158.0-alpha.2. These are compatibility examples, not a supported-version range.
+This reference separates what the providers document from what the reader observed in their internal formats. The observations cover Claude Code 2.1.72 and 2.1.266, and Codex 0.157.1 and 0.158.0-alpha.2. These versions are examples of compatibility, not a supported range.
 
-## Storage and authority
+## Stores
 
-| Store | Purpose | Reader |
+| Store | Contents | Reader |
 |---|---|---|
 | Claude `projects/<project>/<session>.jsonl` under `CLAUDE_CONFIG_DIR`, default `~/.claude` | Messages, tool records, and session metadata | `internal/session/reader.go`, `calls.go` |
-| Claude `<session>/subagents/agent-*.jsonl` | Separate child-agent transcripts | `internal/index/scanner.go` |
-| Claude checkpoint files referenced by `file-history-snapshot` | Historical file bytes, subject to retention | `internal/session/files.go` |
-| Codex `sessions/` and `archived_sessions/` under `CODEX_HOME`, default `~/.codex` | Persisted rollout records | `internal/session/codex.go`, `calls.go` |
+| Claude `<session>/subagents/agent-*.jsonl` | Separate subagent transcripts | `internal/index/scanner.go` |
+| Claude checkpoint files referenced by `file-history-snapshot` records | Historical file bytes, subject to retention | `internal/session/files.go` |
+| Codex `sessions/` and `archived_sessions/` under `CODEX_HOME`, default `~/.codex` | Rollout records | `internal/session/codex.go`, `calls.go` |
 | Codex `state_<n>.sqlite` under `CODEX_SQLITE_HOME` or `CODEX_HOME` | Thread metadata and rollout locations | `internal/index/codex.go` |
-| `agent-sessions/index.sqlite` in the OS user cache directory | Rebuildable metadata and conversation search text | `internal/index/database.go` |
+| `agent-sessions/index.sqlite` in the user cache directory | Rebuildable metadata and conversation text | `internal/index/database.go` |
 
-Claude explicitly calls its JSONL entry format internal and warns that it can change between releases. Project directory encoding is not reversible: it replaces non-alphanumeric characters and can truncate long names or use a configured name. Recorded working directories take precedence over decoding directory names. Retention and disabled persistence can remove or prevent local history. See [Claude session storage](https://code.claude.com/docs/en/sessions).
+Claude documents its JSONL format as internal and subject to change between releases. Its project directory names are not reversible: the encoding replaces non-alphanumeric characters, and it can truncate long names or use a configured name. The reader prefers recorded working directories over decoded directory names. Retention settings and disabled persistence can remove local history or prevent it. See [Claude session storage](https://code.claude.com/docs/en/sessions).
 
-The Codex database supplies discovery metadata and selects the current physical rollout. The fallback scans physical files when the database is absent, unreadable, or yields no entries. A missing selected paginated rollout is an error, so fallback cannot replace it with obsolete history. Discovery does not merge unindexed files into a nonempty database result.
+The Codex database supplies discovery metadata and selects the current rollout of each thread. When the database is absent, unreadable, or empty, discovery scans the rollout files instead. A rollout that the database selects but that is missing is an error, so the scan never replaces it with older history. Discovery does not add unlisted files to a nonempty database result. The tool does not read Codex's `sqlite_home` setting. When it finds no database at the selected location, it reads the rollout files.
 
-## Raw records and resumed history differ
+## Codex record types
 
-Claude records include message UUIDs, parent links, compaction boundaries, and generated summaries. A generated summary can have role `user`; that role alone does not establish human authorship. The SDK's store-backed `getSessionMessages` returns the linked post-compaction chain. A configured store adapter's `load` returns raw entries including earlier history; the application implements that adapter. The store does not mirror checkpoint files. See [Claude session-store semantics](https://code.claude.com/docs/en/agent-sdk/session-storage).
+Each rollout line has the shape `{timestamp, type, payload}`. The reader uses these records:
 
-Our Claude reader emits text in file order without interpreting parent links or compaction flags. This preserves archive evidence but does not identify the selected branch. Summaries intentionally retain role `user` in both official SDKs. SDK readers also differ: TypeScript 0.3.283 restores preserved compaction segments and sibling response fragments that Python 0.2.160 omits. Matching a simple parent walk would not establish exact resume-context support.
+| Record | Contents |
+|---|---|
+| `session_meta`, first line | Thread ID, working directory, git branch, CLI version, `thread_source` |
+| `turn_context` | Model, reasoning effort, sandbox policy |
+| `response_item` with payload `message` | User `input_text` and assistant `output_text`. Preferred over the legacy events below. |
+| `event_msg` with payload `user_message` or `agent_message` | The conversation in older rollouts |
+| `event_msg` with payload `token_count` | Running totals. The last record counts. Records are not summed. |
+| `event_msg` with a successful `patch_apply_end` | `changes`: content for adds and deletes, `unified_diff` for updates |
+| `event_msg` with `item_completed` and a completed `FileChange` | The same change data in newer rollouts |
+| `response_item` with payload `function_call` or `custom_tool_call` | Tool names and inputs |
 
-Codex separates model-input `response_item` records from conversation events. Observed user-role response items include injected AGENTS instructions. Our reader can use those instructions as the first user turn and fallback title. Upstream's [history projection](https://github.com/openai/codex/blob/1b1835f751ebdc0cfc50b3fe55d4571dbb294563/codex-rs/app-server-protocol/src/protocol/thread_history.rs) treats these record families differently.
+## Raw records differ from resumed history
 
-Codex archive IDs use `<thread-id>/<rollout-id>` for recognized rollout filenames. The original rollout repeats the thread ID as its rollout ID. These references keep search, retrieval, and browser previews on the same physical history. An unqualified logical ID resolves only when unambiguous; resume commands always use the logical ID.
+Claude records carry message UUIDs, parent links, compaction boundaries, and generated summaries. A generated summary can have the role `user`, so the role alone does not prove that a person wrote it. The SDK's store-backed `getSessionMessages` returns the linked chain after compaction. A store adapter's `load` returns raw entries, including earlier history, and the application implements that adapter. The store does not copy checkpoint files. See [Claude session-store semantics](https://code.claude.com/docs/en/agent-sdk/session-storage).
 
-Codex readers follow `history_base.thread_id` as a physical rollout reference, recursively reading ancestors before local records. Ancestor records are bounded by both `end_byte_offset` and `end_ordinal_exclusive`. Conversation, calls, file evidence, and enrichment share this traversal. `show` and `calls` retain physical `source` paths and line numbers. Missing or ambiguous ancestors, cycles, invalid cutoffs, and compressed `.zst` histories fail explicitly. See the pinned upstream [lineage rules](https://github.com/openai/codex/blob/1b1835f751ebdc0cfc50b3fe55d4571dbb294563/codex-rs/thread-store/src/local/rollout_lineage.rs) and [rollout selection](https://github.com/openai/codex/blob/1b1835f751ebdc0cfc50b3fe55d4571dbb294563/codex-rs/thread-store/src/local/thread_rollout_resolver.rs).
+The Claude reader in `agent-sessions` returns text in file order. It does not follow parent links or compaction flags. This keeps all archived evidence but does not identify the branch the agent continued. Both official SDKs keep the role `user` on summaries. The SDKs also differ from each other: TypeScript 0.3.283 restores preserved compaction segments and sibling response fragments that Python 0.2.160 omits. Matching a simple parent walk would therefore still not reproduce the resumed context.
 
-This reconstructs referenced archive ranges, not the provider's full conversation projection. Injected instructions remain visible, and legacy rollback markers are not replayed. Claude branch selection remains unsupported. Conversation selection must stay separate from filesystem state: a conversation-only rewind can retain file writes from the discarded branch.
+Codex separates model-input `response_item` records from conversation events. In observed rollouts, user-role response items include injected `AGENTS.md` instructions. The reader can return those instructions as the first user turn and use them as a fallback title. Upstream's [history projection](https://github.com/openai/codex/blob/1b1835f751ebdc0cfc50b3fe55d4571dbb294563/codex-rs/app-server-protocol/src/protocol/thread_history.rs) treats these record types differently.
+
+Codex archive IDs have the form `<thread-id>/<rollout-id>` for recognized rollout file names. The original rollout repeats the thread ID as its rollout ID. These IDs keep search, retrieval, and browser previews on the same physical history. A logical ID alone resolves only when it is unambiguous. Resume commands always use the logical ID.
+
+Codex readers follow `history_base.thread_id` to an ancestor rollout and read the ancestor's records before the local ones. `end_byte_offset` and `end_ordinal_exclusive` bound each ancestor. Conversation, calls, file evidence, and metrics share this traversal. `show` and `calls` return the physical `source` path and line of each record. Missing or ambiguous ancestors, cycles, invalid cutoffs, and compressed `.zst` histories are errors. See the pinned upstream [lineage rules](https://github.com/openai/codex/blob/1b1835f751ebdc0cfc50b3fe55d4571dbb294563/codex-rs/thread-store/src/local/rollout_lineage.rs) and [rollout selection](https://github.com/openai/codex/blob/1b1835f751ebdc0cfc50b3fe55d4571dbb294563/codex-rs/thread-store/src/local/thread_rollout_resolver.rs).
+
+The result is the referenced archive ranges, not the provider's full conversation projection. Injected instructions stay visible, and the reader does not replay legacy rollback markers. Claude branch selection is not supported. Treat conversation history and filesystem state separately: a rewind of the conversation alone can keep the file writes of the discarded branch.
 
 ## Attempts, results, and file bytes
 
-`calls` returns attempted tool inputs. Execution success requires the corresponding result, not an assistant's statement or a tool-call name. File recovery accepts recognized successful writes or patch events and readable checkpoints. It does not execute recorded commands.
+`calls` returns attempted tool inputs. Only the matching tool result shows that a call succeeded. An assistant's statement or the tool name does not. File recovery accepts recognized successful writes, successful patch events, and readable checkpoints. It never runs recorded commands.
 
-Claude checkpoints are separate from the transcript and can expire. The current documentation limits retained checkpoints and excludes Bash edits from checkpoint coverage. A transcript copy therefore need not contain recoverable file bytes. See [checkpointing](https://code.claude.com/docs/en/checkpointing). `recovery_source` identifies recorded provenance; `recovery_earlier_version` warns when recovery falls back. Neither proves the final file state. Codex updates expose diffs rather than complete files.
+Claude stores checkpoints apart from the transcript, and they can expire. The current documentation limits how many checkpoints Claude keeps and excludes Bash edits from them. A copied transcript can therefore lack recoverable file bytes. See [checkpointing](https://code.claude.com/docs/en/checkpointing). `recovery_source` names the recorded source of the bytes, and `recovery_earlier_version` marks a fallback to an older version. Neither proves the final state of the file. Codex updates hold diffs, not complete files. [Recover a file](recover-a-file.md) covers the steps.
 
-Claude usage can repeat across content fragments sharing one `message.id`. TUI enrichment counts each response once and uses its latest recorded usage, while collecting tools from all fragments. Records without response IDs retain per-record accounting. These are provider-reported usage totals, not measurements of retrieval savings. Headless retrieval output does not use this enrichment.
+Claude can repeat usage across content fragments that share one `message.id`. Browser metrics count each response once with its latest usage, and collect tools from all fragments. Records without a response ID are counted individually. These totals are what the provider reported, not measurements of retrieval savings. The CLI does not use these metrics.
 
-## CLI interpretation
+## Empty and partial results
 
-| Command | Successful payload | Meaning |
-|---|---|---|
-| `search` | `data.hits`, `data.count` | Ranked discovered sessions with preview snippets |
-| `show` | `data.turns` | Extracted conversation text in record order |
-| `calls` | `data.calls`, `data.count` | Recorded tool inputs |
-| `files` | `data.files`, `data.count` | Recognized file-change and recovery evidence |
-| `cat` | Raw bytes, even with `--json` | A recoverable historical file; an empty file produces zero bytes |
+`truncated` reports omitted records. Search snippets are previews whether or not `truncated` is present. [The CLI reference](cli.md) lists the fields.
 
-A missing expected collection is a contract mismatch, not an empty result. `schema --json` lists payload paths by command under `data.response_fields`. `data.raw_output_commands` identifies exceptions such as `cat`. Failures use a nonzero exit status; JSON diagnostics go to stderr.
+An empty search means no recognized match among the discovered sessions under the filters. Missing provider directories are allowed. An error while listing a selected provider's directories returns `store_unavailable`, not an empty success. Discovery can still skip individual transcripts with unreadable or unrecognized headers, and parsing skips malformed records. Search compares file signatures, uses stored text for unchanged transcripts, and returns errors from refreshing changed ones. Missing or ambiguous Codex ancestors fail even after indexing. An empty result therefore does not prove complete coverage of history.
 
-Envelope `truncated` describes omitted records. Search snippets are previews even without this flag. `show` marks shortened text with `text_truncated`; `calls` uses `input_truncated`. `--max-chars 0` returns complete turns or inputs, preserving whitespace; it does not make search snippets complete. CLI `--limit 0` selects defaults.
+## Provider interfaces
 
-For search, a positive `--max-chars` bounds each snippet in Unicode characters, including its role label. The label is omitted when it leaves no room for content.
+The index package owns discovery and cached metadata. The session package owns archive traversal, record interpretation, and recovery evidence. The CLI and the browser read conversations through `WalkSearchable`. `ReadPreview` collects only a bounded prefix. JSON decoding decides record types. A byte-level filter can skip irrelevant records, but it must let records with escaped strings through to decoding.
 
-An empty search means no recognized matches among discovered sessions under the filters. Missing provider directories are allowed. Errors enumerating a selected provider's directories return `store_unavailable` instead of empty success. Individual unreadable or unrecognized transcript headers can still be skipped during discovery, and malformed records are skipped during parsing. Search checks file signatures, uses persisted text for unchanged transcripts, and propagates errors refreshing changed transcripts. Missing or ambiguous Codex ancestors still fail after indexing. Empty results therefore do not establish complete historical coverage.
+Claude's [Python SDK](https://code.claude.com/docs/en/agent-sdk/python) offers `list_sessions` and `get_session_messages` for saved local sessions. For history as the provider interprets it, these functions are a better comparison than another independent JSONL parser. Resuming with a new prompt is a different operation and can create new records.
 
-Discovery and search each wait at most five seconds for the shared index lock. Lock contention beyond that wait returns `store_unavailable` with a retry hint. Changed transcripts are reread, but unchanged conversation messages retain their existing full-text index entries.
+Codex documents read-only history retrieval through `thread/read` and the paginated `thread/turns/list`. It also documents rollback markers and moves to the archive. See the [app-server protocol](https://developers.openai.com/codex/app-server). Generate the installed version's schema with `codex app-server generate-json-schema --out <temporary-directory>` before you rely on its fields. The schema of version 0.157.1 deprecates loading the full history of paginated threads, and it adds turn pagination with a selection of item details. `agent-sessions` does not use these interfaces and does not replay their history rules.
 
-## Provider interfaces for comparison
-
-The index owns discovery and cached metadata. The session package owns archive traversal, record interpretation, and recovery evidence. CLI and TUI conversation retrieval share `WalkSearchable`; `ReadPreview` only collects a bounded prefix. JSON decoding determines record types. Candidate filtering can skip irrelevant records but must admit escaped strings for decoding.
-
-Claude's [Python SDK](https://code.claude.com/docs/en/agent-sdk/python) offers `list_sessions` and `get_session_messages` for saved local sessions. These are better comparison points for provider-interpreted history than another independently written JSONL parser. Resuming with a new prompt is a different operation and can create new evidence.
-
-Codex documents read-only history retrieval through `thread/read` and paginated `thread/turns/list`. It also documents rollback markers and archival moves. See the [app-server protocol](https://developers.openai.com/codex/app-server). Generate the installed version's schema with `codex app-server generate-json-schema --out <temporary-directory>` before relying on fields. Version 0.157.1's generated schema deprecates full-history hydration for paginated threads and exposes turn pagination with item-detail selection. This project does not currently use those interfaces or replay their history semantics.
-
-Provider conversation APIs do not supply the physical source-line contract used by `show` and `calls`. They cannot replace archive retrieval and file recovery together. Using them for a provider-selected conversation would be a separate capability, not a fallback that silently changes archive results.
+Provider conversation APIs do not return the physical source lines that `show` and `calls` report. They cannot replace archive retrieval and file recovery together. Using them for the conversation a provider selects would be a separate feature, not a fallback that silently changes archive results.
